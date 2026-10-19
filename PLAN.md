@@ -80,6 +80,9 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 - 17:30 — Updated PLAN.md as implementation log
 - 20:14 — Added `Ctrl+Q` to cancel comment editing without saving
 - 20:14 — Added Rust syntax highlighting for keywords, strings, and comments in TUI
+- 20:48 — Implemented `--path` flag for recursive directory annotation
+- 20:48 — Implemented `--hash-scope` flag for configurable hash scope (file/range)
+- 20:48 — Added file browser UI with navigation (j/k move, Enter select, h/Left parent)
 
 ## Feedback from User Testing
 
@@ -92,8 +95,8 @@ Issues and feature requests collected from annotation files created during testi
 - **Cancel comment**: Added `Ctrl+Q` in editing mode to discard a comment without saving
 - **Syntax highlighting**: Added basic Rust syntax coloring for keywords (fn, let, pub, etc.), strings, and comments (line and block)
 
-### Feature Requests (Future)
-- Support commenting entire directories or paths (recursive annotation)
-- Built-in file selection/navigation
-- Configurable hash scope (file vs. line range)
-- Special "/exit" command to cancel editing without saving (implemented as `Ctrl+Q` instead)
+### Feature Requests (Addressed)
+- **Support commenting entire directories or paths**: Implemented `--path` CLI flag for recursive annotation of directories
+- **Built-in file selection/navigation**: Implemented file browser mode in TUI with `j/k` navigation, `Enter` to select, `h/Left` to go to parent
+- **Configurable hash scope**: Implemented `--hash-scope` CLI flag with `file` (default) or `range` options
+- **Special "/exit" command**: Implemented as `Ctrl+Q` instead, which is more idiomatic for TUI

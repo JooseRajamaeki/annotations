@@ -6,6 +6,15 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+/// Hash scope determines what content is hashed
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashScope {
+    /// Hash the entire file content
+    File,
+    /// Hash only the selected line range
+    LineRange,
+}
+
 /// A single annotation: a comment tied to a line range of a file,
 /// plus the metadata collected at save time.
 pub struct Annotation {
@@ -70,6 +79,73 @@ impl Annotation {
         format!("{}.md", Uuid::new_v4())
     }
 
+    /// Create an annotation for a path (file or directory)
+    pub fn collect_for_path(
+        path: &Path,
+        note: &str,
+        hash_scope: HashScope,
+    ) -> Vec<Annotation> {
+        let mut annotations = Vec::new();
+        
+        if path.is_dir() {
+            // Recursively find all files in the directory
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries {
+                    if let Ok(entry) = entry {
+                        let entry_path = entry.path();
+                        if entry_path.is_file() {
+                            // For directories, we annotate each file with the full path
+                            // and use line range 1-1 (whole file)
+                            if let Ok(contents) = fs::read_to_string(&entry_path) {
+                                let annotation = Annotation {
+                                    file: entry_path.clone(),
+                                    line_start: 1,
+                                    line_end: contents.lines().count(),
+                                    git_commit: git_commit(&entry_path),
+                                    content_sha256: match hash_scope {
+                                        HashScope::File => sha256_hex(contents.as_bytes()),
+                                        HashScope::LineRange => {
+                                            let start = 0.min(contents.len());
+                                            let end = contents.len();
+                                            sha256_hex(&contents.as_bytes()[start..end])
+                                        }
+                                    },
+                                    created_at: Utc::now().to_rfc3339(),
+                                    note: note.to_string(),
+                                };
+                                annotations.push(annotation);
+                            }
+                        } else if entry_path.is_dir() {
+                            // Recursively process subdirectories
+                            let sub_annotations = Annotation::collect_for_path(&entry_path, note, hash_scope);
+                            annotations.extend(sub_annotations);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Single file
+            if let Ok(contents) = fs::read_to_string(path) {
+                let total_lines = contents.lines().count();
+                let annotation = Annotation {
+                    file: path.to_path_buf(),
+                    line_start: 1,
+                    line_end: total_lines,
+                    git_commit: git_commit(path),
+                    content_sha256: match hash_scope {
+                        HashScope::File => sha256_hex(contents.as_bytes()),
+                        HashScope::LineRange => sha256_hex(contents.as_bytes()),
+                    },
+                    created_at: Utc::now().to_rfc3339(),
+                    note: note.to_string(),
+                };
+                annotations.push(annotation);
+            }
+        }
+        
+        annotations
+    }
+
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("# Annotation\n\n");
@@ -103,6 +179,28 @@ pub fn save_annotation(
     let path = output_dir.join(annotation.file_name());
     fs::write(&path, annotation.to_markdown())?;
     Ok(path)
+}
+
+/// Save annotations for an entire path (file or directory)
+/// Returns the paths of all written annotation files.
+pub fn save_path_annotation(
+    path: &Path,
+    note: &str,
+    output_dir: &Path,
+    hash_scope: HashScope,
+) -> std::io::Result<Vec<PathBuf>> {
+    let annotations = Annotation::collect_for_path(path, note, hash_scope);
+    let mut saved_paths = Vec::new();
+    
+    fs::create_dir_all(output_dir)?;
+    
+    for annotation in annotations {
+        let file_path = output_dir.join(annotation.file_name());
+        fs::write(&file_path, annotation.to_markdown())?;
+        saved_paths.push(file_path);
+    }
+    
+    Ok(saved_paths)
 }
 
 #[cfg(test)]

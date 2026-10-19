@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,6 +18,7 @@ pub enum Mode {
     Normal,
     Visual,
     Editing,
+    FileBrowser,
 }
 
 impl Mode {
@@ -25,12 +27,29 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Visual => "VISUAL (painting)",
             Mode::Editing => "EDITING",
+            Mode::FileBrowser => "FILE BROWSER",
         }
     }
 }
 
+/// Information about a file or directory entry
+#[derive(Clone)]
+struct FileInfo {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
+impl FileInfo {
+    fn new(path: PathBuf) -> FileInfo {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let is_dir = path.is_dir();
+        FileInfo { path, name, is_dir }
+    }
+}
+
 pub struct App {
-    file: PathBuf,
+    file: Option<PathBuf>,
     contents: String,
     lines: Vec<String>,
     output_dir: PathBuf,
@@ -44,6 +63,11 @@ pub struct App {
     scroll: usize,
     status: String,
     should_quit: bool,
+    /// File browser state
+    browser_path: PathBuf,
+    browser_entries: Vec<FileInfo>,
+    browser_cursor: usize,
+    browser_scroll: usize,
 }
 
 /// Colorize a line of Rust code with basic syntax highlighting
@@ -163,7 +187,7 @@ impl App {
         let lines: Vec<String> = contents.lines().map(str::to_string).collect();
         let lines = if lines.is_empty() { vec![String::new()] } else { lines };
         App {
-            file: file.to_path_buf(),
+            file: Some(file.to_path_buf()),
             contents: contents.to_string(),
             lines,
             output_dir: output_dir.to_path_buf(),
@@ -175,7 +199,64 @@ impl App {
             scroll: 0,
             status: String::new(),
             should_quit: false,
+            browser_path: output_dir.to_path_buf(),
+            browser_entries: Vec::new(),
+            browser_cursor: 0,
+            browser_scroll: 0,
         }
+    }
+
+    /// Create a new App in file browser mode
+    pub fn new_browser(start_path: &Path, output_dir: &Path) -> App {
+        let mut app = App {
+            file: None,
+            contents: String::new(),
+            lines: vec![String::new()],
+            output_dir: output_dir.to_path_buf(),
+            cursor: 0,
+            anchor: None,
+            mode: Mode::FileBrowser,
+            note: Vec::new(),
+            note_cursor: 0,
+            scroll: 0,
+            status: String::new(),
+            should_quit: false,
+            browser_path: start_path.to_path_buf(),
+            browser_entries: Vec::new(),
+            browser_cursor: 0,
+            browser_scroll: 0,
+        };
+        app.load_browser_entries();
+        app
+    }
+
+    /// Load directory entries for file browser
+    fn load_browser_entries(&mut self) {
+        self.browser_entries.clear();
+        self.browser_cursor = 0;
+        self.browser_scroll = 0;
+        
+        if let Ok(entries) = fs::read_dir(&self.browser_path) {
+            let mut entries_vec: Vec<FileInfo> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| FileInfo::new(e.path()))
+                .collect();
+            
+            // Sort directories first, then files
+            entries_vec.sort_by(|a, b| {
+                if a.is_dir == b.is_dir {
+                    a.name.cmp(&b.name)
+                } else if a.is_dir {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+            
+            self.browser_entries = entries_vec;
+        }
+        
+        self.status = format!("Browsing: {}", self.browser_path.display());
     }
 
     /// Selected line range, 1-based inclusive.
@@ -222,9 +303,13 @@ impl App {
             return;
         }
         let (start, end) = self.selection();
-        match save_annotation(&self.file, &self.contents, start, end, &note, &self.output_dir) {
-            Ok(path) => self.status = format!("saved: {}", path.display()),
-            Err(e) => self.status = format!("save failed: {e}"),
+        if let Some(file) = &self.file {
+            match save_annotation(file, &self.contents, start, end, &note, &self.output_dir) {
+                Ok(path) => self.status = format!("saved: {}", path.display()),
+                Err(e) => self.status = format!("save failed: {e}"),
+            }
+        } else {
+            self.status = "no file loaded".to_string();
         }
     }
 
@@ -276,6 +361,78 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::FileBrowser => match key.code {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Esc => {
+                    // Go back to parent directory or quit if at root
+                    if self.browser_path.parent().is_some() {
+                        self.browser_path = self.browser_path.parent().unwrap().to_path_buf();
+                        self.load_browser_entries();
+                    } else {
+                        self.should_quit = true;
+                    }
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.browser_cursor = (self.browser_cursor + 1).min(self.browser_entries.len().saturating_sub(1));
+                    // Scroll if cursor goes off screen
+                    let visible = 10; // Approximate visible items
+                    if self.browser_cursor >= self.browser_scroll + visible {
+                        self.browser_scroll = self.browser_cursor + 1 - visible;
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if self.browser_cursor > 0 {
+                        self.browser_cursor -= 1;
+                        // Scroll up if needed
+                        if self.browser_cursor < self.browser_scroll {
+                            self.browser_scroll = self.browser_cursor;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(entry) = self.browser_entries.get(self.browser_cursor) {
+                        if entry.is_dir {
+                            // Enter directory
+                            self.browser_path = entry.path.clone();
+                            self.load_browser_entries();
+                        } else {
+                            // Select file - load it for editing
+                            if let Ok(contents) = fs::read_to_string(&entry.path) {
+                                self.file = Some(entry.path.clone());
+                                self.contents = contents;
+                                self.lines = self.contents.lines().map(str::to_string).collect();
+                                if self.lines.is_empty() {
+                                    self.lines = vec![String::new()];
+                                }
+                                self.mode = Mode::Normal;
+                                self.cursor = 0;
+                                self.anchor = None;
+                                self.scroll = 0;
+                                self.status = String::new();
+                            } else {
+                                self.status = format!("error: cannot read {}", entry.path.display());
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    // Same as Enter for directories
+                    if let Some(entry) = self.browser_entries.get(self.browser_cursor) {
+                        if entry.is_dir {
+                            self.browser_path = entry.path.clone();
+                            self.load_browser_entries();
+                        }
+                    }
+                }
+                KeyCode::Char('h') | KeyCode::Left => {
+                    // Go to parent directory
+                    if self.browser_path.parent().is_some() {
+                        self.browser_path = self.browser_path.parent().unwrap().to_path_buf();
+                        self.load_browser_entries();
+                    }
+                }
+                _ => {}
+            },
         }
     }
 }
@@ -307,9 +464,38 @@ pub fn run(file: &Path, contents: &str, output_dir: &Path) -> std::io::Result<()
     result
 }
 
+/// Run the file browser mode
+pub fn run_browser(start_path: &Path, output_dir: &Path) -> std::io::Result<Option<PathBuf>> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+
+    let mut app = App::new_browser(start_path, output_dir);
+    let result = loop {
+        terminal.draw(|f| render(f, &mut app))?;
+        if app.should_quit {
+            break Ok(app.file.clone());
+        }
+        match event::read() {
+            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result
+}
+
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let editing = app.mode == Mode::Editing;
+    let file_browser = app.mode == Mode::FileBrowser;
 
     let chunks = if editing {
         Layout::vertical([
@@ -317,6 +503,13 @@ fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(3),
+        ])
+        .split(area)
+    } else if file_browser {
+        Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(area)
     } else {
@@ -333,108 +526,176 @@ fn render(frame: &mut Frame, app: &mut App) {
         (chunks[0], chunks[1], chunks[2], None)
     };
 
-    // Keep the cursor line visible.
-    let visible = body_area.height as usize;
-    if app.cursor < app.scroll {
-        app.scroll = app.cursor;
-    }
-    if visible > 0 && app.cursor >= app.scroll + visible {
-        app.scroll = app.cursor + 1 - visible;
-    }
-
-    let (sel_start, sel_end) = app.selection();
-
-    // Header
-    let header = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.file.display()),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {} lines ", app.lines.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("[{}]", app.mode.label()),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            format!(" · saves to: {}", app.output_dir.display()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            "   j/k move · V paint multiple lines · c comment · Ctrl+Q cancel · q quit",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(header), header_area);
-
-    // Body: painted lines are highlighted.
-    let gutter = app.lines.len().to_string().len().max(3);
-    let mut body_lines: Vec<Line> = Vec::new();
-    for row in 0..visible {
-        let idx = app.scroll + row;
-        if idx >= app.lines.len() {
-            break;
+    // Handle file browser mode separately
+    if file_browser {
+        // Keep the cursor line visible.
+        let visible = body_area.height as usize;
+        if app.browser_cursor < app.browser_scroll {
+            app.browser_scroll = app.browser_cursor;
         }
-        let lineno = idx + 1;
-        let selected = app.anchor.is_some() && lineno >= sel_start && lineno <= sel_end;
-        let mut style = Style::default();
-        if selected {
-            style = style.bg(Color::Rgb(45, 70, 110)).fg(Color::White);
+        if visible > 0 && app.browser_cursor >= app.browser_scroll + visible {
+            app.browser_scroll = app.browser_cursor + 1 - visible;
         }
-        if idx == app.cursor && !selected {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        let marker = if selected { ">" } else { " " };
-        
-        // Apply syntax highlighting
-        let highlighted = syntax_highlight(&app.lines[idx]);
-        let mut line_spans = vec![Span::styled(format!("{marker}{lineno:>gutter$} "), Style::default().fg(Color::DarkGray))];
-        
-        // Apply selection/cursor style to highlighted spans
-        if selected {
-            for span in highlighted {
-                line_spans.push(Span::styled(span.content, style));
+
+        // Header
+        let header = Line::from(vec![
+            Span::styled(
+                format!(" Browse: {} ", app.browser_path.display()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("[{}]", app.mode.label()),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                "   j/k move · Enter select · h/Left parent · q quit",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(header), header_area);
+
+        // Body: file/directory list
+        let mut body_lines: Vec<Line> = Vec::new();
+        for row in 0..visible {
+            let idx = app.browser_scroll + row;
+            if idx >= app.browser_entries.len() {
+                break;
             }
-        } else if idx == app.cursor {
-            for span in highlighted {
-                line_spans.push(Span::styled(span.content, span.style.patch(style)));
+            let entry = &app.browser_entries[idx];
+            let is_selected = idx == app.browser_cursor;
+            let mut style = Style::default();
+            if is_selected {
+                style = style.bg(Color::Rgb(45, 70, 110)).fg(Color::White);
             }
-        } else {
-            for span in highlighted {
-                line_spans.push(span);
+            if entry.is_dir {
+                style = style.add_modifier(Modifier::BOLD);
             }
+            let marker = if entry.is_dir { "📁" } else { "📄" };
+            body_lines.push(Line::from(vec![
+                Span::styled(format!("{marker} "), style),
+                Span::styled(&entry.name, style),
+            ]));
         }
+        frame.render_widget(Paragraph::new(body_lines), body_area);
         
-        body_lines.push(Line::from(line_spans));
-    }
-    frame.render_widget(Paragraph::new(body_lines), body_area);
+        // Status bar for file browser
+        let status = Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.mode.label()),
+                Style::default().fg(Color::Black).bg(Color::Gray),
+            ),
+            Span::styled(
+                format!(" {} entries ", app.browser_entries.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(&app.status, Style::default().fg(Color::Green)),
+        ]);
+        frame.render_widget(Paragraph::new(status), status_area);
+    } else {
+        // Keep the cursor line visible.
+        let visible = body_area.height as usize;
+        if app.cursor < app.scroll {
+            app.scroll = app.cursor;
+        }
+        if visible > 0 && app.cursor >= app.scroll + visible {
+            app.scroll = app.cursor + 1 - visible;
+        }
 
-    // Status bar
-    let status = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.mode.label()),
-            Style::default().fg(Color::Black).bg(Color::Gray),
-        ),
-        Span::styled(
-            format!(" lines {sel_start}-{sel_end} of {} ", app.lines.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(&app.status, Style::default().fg(Color::Green)),
-    ]);
-    frame.render_widget(Paragraph::new(status), status_area);
+        let (sel_start, sel_end) = app.selection();
 
-    // Note editor
-    if let Some(input_area) = input_area {
-        let note: String = app.note.iter().collect();
-        let input = Paragraph::new(note.as_str())
-            .block(Block::bordered().title("Comment — Esc to save · Ctrl+Q cancel · Enter for newline"))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(input, input_area);
-        let cursor_x = input_area.x + 1 + app.note_cursor as u16;
-        let cursor_y = input_area.y + 1;
-        frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(1)), cursor_y));
+        // Header
+        let header = Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.file.as_ref().map_or("No file".to_string(), |f| f.display().to_string())),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} lines ", app.lines.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("[{}]", app.mode.label()),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!(" · saves to: {}", app.output_dir.display()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                "   j/k move · V paint multiple lines · c comment · Ctrl+Q cancel · q quit",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(header), header_area);
+
+        // Body: painted lines are highlighted.
+        let gutter = app.lines.len().to_string().len().max(3);
+        let mut body_lines: Vec<Line> = Vec::new();
+        for row in 0..visible {
+            let idx = app.scroll + row;
+            if idx >= app.lines.len() {
+                break;
+            }
+            let lineno = idx + 1;
+            let selected = app.anchor.is_some() && lineno >= sel_start && lineno <= sel_end;
+            let mut style = Style::default();
+            if selected {
+                style = style.bg(Color::Rgb(45, 70, 110)).fg(Color::White);
+            }
+            if idx == app.cursor && !selected {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let marker = if selected { ">" } else { " " };
+            
+            // Apply syntax highlighting
+            let highlighted = syntax_highlight(&app.lines[idx]);
+            let mut line_spans = vec![Span::styled(format!("{marker}{lineno:>gutter$} "), Style::default().fg(Color::DarkGray))];
+            
+            // Apply selection/cursor style to highlighted spans
+            if selected {
+                for span in highlighted {
+                    line_spans.push(Span::styled(span.content, style));
+                }
+            } else if idx == app.cursor {
+                for span in highlighted {
+                    line_spans.push(Span::styled(span.content, span.style.patch(style)));
+                }
+            } else {
+                for span in highlighted {
+                    line_spans.push(span);
+                }
+            }
+            
+            body_lines.push(Line::from(line_spans));
+        }
+        frame.render_widget(Paragraph::new(body_lines), body_area);
+
+        // Status bar
+        let (sel_start, sel_end) = app.selection();
+        let status = Line::from(vec![
+            Span::styled(
+                format!(" {} ", app.mode.label()),
+                Style::default().fg(Color::Black).bg(Color::Gray),
+            ),
+            Span::styled(
+                format!(" lines {sel_start}-{sel_end} of {} ", app.lines.len()),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(&app.status, Style::default().fg(Color::Green)),
+        ]);
+        frame.render_widget(Paragraph::new(status), status_area);
+
+        // Note editor
+        if let Some(input_area) = input_area {
+            let note: String = app.note.iter().collect();
+            let input = Paragraph::new(note.as_str())
+                .block(Block::bordered().title("Comment — Esc to save · Ctrl+Q cancel · Enter for newline"))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(input, input_area);
+            let cursor_x = input_area.x + 1 + app.note_cursor as u16;
+            let cursor_y = input_area.y + 1;
+            frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(1)), cursor_y));
+        }
     }
 }
 
