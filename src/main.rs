@@ -85,9 +85,10 @@ fn print_help() {
     eprintln!("annotator — annotate code files with review-style comments");
     eprintln!();
     eprintln!("usage:");
-    eprintln!("  annotator <file>                          interactive TUI");
-    eprintln!("  annotator <file> --lines A-B --note TEXT  save an annotation without the TUI");
-    eprintln!("  annotator --path <path> --note TEXT       annotate all files in a path (recursive)");
+    eprintln!("  annotator                              interactive file browser");
+    eprintln!("  annotator <file>                       interactive TUI");
+    eprintln!("  annotator <file> --lines A-B --note TEXT   save an annotation without the TUI");
+    eprintln!("  annotator --path <path> --note TEXT        annotate all files in a path (recursive)");
     eprintln!();
     eprintln!("options:");
     eprintln!("  --lines A-B       line range to annotate (1-based, inclusive)");
@@ -128,47 +129,68 @@ fn main() -> ExitCode {
     }
 
     // Handle file mode
-    let file = match cli.file {
-        Some(f) => f,
-        None => {
-            eprintln!("error: no file specified");
-            print_help();
-            return ExitCode::from(2);
-        }
-    };
-
-    let contents = match std::fs::read_to_string(&file) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {e}", file.display());
-            return ExitCode::from(1);
-        }
-    };
-
-    let total_lines = contents.lines().count();
-    if let (Some((start, end)), Some(note)) = (cli.lines, cli.note.clone()) {
-        if start > total_lines {
-            eprintln!("error: line range starts beyond file length ({} lines)", total_lines);
-            return ExitCode::from(1);
-        }
-        let end = end.min(total_lines);
-        match save_annotation(&file, &contents, start, end, &note, &cli.output_dir) {
-            Ok(path) => {
-                println!("saved annotation: {}", path.display());
-                return ExitCode::SUCCESS;
-            }
+    if let Some(file) = cli.file {
+        let contents = match std::fs::read_to_string(&file) {
+            Ok(c) => c,
             Err(e) => {
-                eprintln!("error: {e}");
+                eprintln!("error: cannot read {}: {e}", file.display());
                 return ExitCode::from(1);
             }
-        }
-    }
+        };
 
-    match app::run(&file, &contents, &cli.output_dir) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(1)
+        let total_lines = contents.lines().count();
+        if let (Some((start, end)), Some(note)) = (cli.lines, cli.note.clone()) {
+            if start > total_lines {
+                eprintln!("error: line range starts beyond file length ({} lines)", total_lines);
+                return ExitCode::from(1);
+            }
+            let end = end.min(total_lines);
+            match save_annotation(&file, &contents, start, end, &note, &cli.output_dir) {
+                Ok(path) => {
+                    println!("saved annotation: {}", path.display());
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+
+        match app::run(&file, &contents, &cli.output_dir) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        }
+    } else {
+        // No file or path specified - launch file browser
+        // Use current directory as starting point
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        match app::run_browser(&current_dir, &cli.output_dir) {
+            Ok(Some(selected_file)) => {
+                // File selected from browser - load it
+                let contents = match std::fs::read_to_string(&selected_file) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: cannot read {}: {e}", selected_file.display());
+                        return ExitCode::from(1);
+                    }
+                };
+                match app::run(&selected_file, &contents, &cli.output_dir) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        ExitCode::from(1)
+                    }
+                }
+            }
+            Ok(None) => ExitCode::SUCCESS, // User quit without selecting
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
         }
     }
 }
