@@ -24,10 +24,10 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - `j`/`k` or arrows: move cursor
   - `V`: enter visual (paint) mode, move to extend the selection
   - `Enter` / `c`: write a note for the current selection
-  - Note editor: type text, `Esc` to finish, `Enter` saves
+  - Note editor: type text, `Esc` to save, `Enter` for newline
   - `q`: quit
 - **Storage**: one Markdown file per annotation, named `<UUID>.md`, written to
-  an `annotations/` directory next to the target file (created if missing).
+  an `annotations/` directory in the current working directory (configurable via `--output-dir`).
 - **Metadata**: collected at save time:
   - `git rev-parse HEAD` of the repo containing the file (optional, if in a repo)
   - SHA-256 of the file contents
@@ -59,14 +59,14 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 
 ## Milestones
 
-1. [ ] Plan written
-2. [ ] Project scaffolded (`cargo new`, deps compile)
-3. [ ] TUI: load + display file, cursor movement
-4. [ ] TUI: visual line selection ("painting")
-5. [ ] TUI: note input mode
-6. [ ] Save annotation `<UUID>.md` with all metadata
-7. [ ] End-to-end test: annotate a sample file, verify output file
-8. [ ] Plan updated as implementation log
+1. [x] Plan written
+2. [x] Project scaffolded (`cargo new`, deps compile)
+3. [x] TUI: load + display file, cursor movement
+4. [x] TUI: visual line selection ("painting")
+5. [x] TUI: note input mode
+6. [x] Save annotation `<UUID>.md` with all metadata
+7. [x] End-to-end test: annotate a sample file, verify output file
+8. [x] Plan updated as implementation log
 
 ## Implementation log
 
