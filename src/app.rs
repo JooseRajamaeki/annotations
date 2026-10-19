@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -44,6 +44,118 @@ pub struct App {
     scroll: usize,
     status: String,
     should_quit: bool,
+}
+
+/// Colorize a line of Rust code with basic syntax highlighting
+fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
+    let mut spans = Vec::new();
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    let keywords: std::collections::HashSet<_> = [
+        "fn", "let", "mut", "const", "static", "pub", "crate", "mod", "use", "extern",
+        "type", "struct", "enum", "union", "trait", "impl", "dyn", "async", "await",
+        "unsafe", "if", "else", "match", "while", "loop", "for", "in", "return",
+        "break", "continue", "where", "as", "super", "self", "Self", "true", "false",
+    ].iter().cloned().collect();
+
+    let mut current_span_start = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Check for line comments
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
+            // Push anything before the comment
+            if i > current_span_start {
+                spans.push(Span::raw(&line[current_span_start..i]));
+            }
+            let comment_start = i;
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            spans.push(Span::styled(&line[comment_start..i], Style::default().fg(Color::DarkGray)));
+            current_span_start = i;
+            continue;
+        }
+
+        // Check for block comments
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            // Push anything before the comment
+            if i > current_span_start {
+                spans.push(Span::raw(&line[current_span_start..i]));
+            }
+            let comment_start = i;
+            i += 2;
+            while i < chars.len() {
+                if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            spans.push(Span::styled(&line[comment_start..i], Style::default().fg(Color::DarkGray)));
+            current_span_start = i;
+            continue;
+        }
+
+        // Check for strings
+        if c == '"' || c == '\'' {
+            // Push anything before the string
+            if i > current_span_start {
+                spans.push(Span::raw(&line[current_span_start..i]));
+            }
+            let string_start = i;
+            let delim = c;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == delim {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            spans.push(Span::styled(&line[string_start..i], Style::default().fg(Color::Green)));
+            current_span_start = i;
+            continue;
+        }
+
+        // Check for keywords
+        if c.is_alphabetic() {
+            let word_start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word = &line[word_start..i];
+            if keywords.contains(word) {
+                // Push anything before the keyword
+                if word_start > current_span_start {
+                    spans.push(Span::raw(&line[current_span_start..word_start]));
+                }
+                spans.push(Span::styled(word, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+                current_span_start = i;
+                continue;
+            }
+            // Not a keyword, just continue (i is already at the end of the word)
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Push any remaining text at the end
+    if current_span_start < line.len() {
+        spans.push(Span::raw(&line[current_span_start..]));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::raw(line));
+    }
+
+    spans
 }
 
 impl App {
@@ -92,6 +204,13 @@ impl App {
         self.note_cursor = 0;
     }
 
+    fn cancel_editing(&mut self) {
+        self.mode = Mode::Normal;
+        self.note.clear();
+        self.note_cursor = 0;
+        self.status = "comment discarded".to_string();
+    }
+
     fn save(&mut self) {
         let note: String = self.note.iter().collect::<String>().trim().to_string();
         self.mode = Mode::Normal;
@@ -138,6 +257,7 @@ impl App {
             },
             Mode::Editing => match key.code {
                 KeyCode::Esc => self.save(),
+                KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => self.cancel_editing(),
                 KeyCode::Enter => {
                     self.note.insert(self.note_cursor, '\n');
                     self.note_cursor += 1;
@@ -239,7 +359,11 @@ fn render(frame: &mut Frame, app: &mut App) {
             Style::default().fg(Color::Cyan),
         ),
         Span::styled(
-            "   j/k move · V paint · c comment · q quit",
+            format!(" · saves to: {}", app.output_dir.display()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            "   j/k move · V paint multiple lines · c comment · Ctrl+Q cancel · q quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
@@ -259,14 +383,31 @@ fn render(frame: &mut Frame, app: &mut App) {
         if selected {
             style = style.bg(Color::Rgb(45, 70, 110)).fg(Color::White);
         }
-        if idx == app.cursor {
+        if idx == app.cursor && !selected {
             style = style.add_modifier(Modifier::BOLD);
         }
         let marker = if selected { ">" } else { " " };
-        body_lines.push(Line::from(vec![
-            Span::styled(format!("{marker}{lineno:>gutter$} "), Style::default().fg(Color::DarkGray)),
-            Span::styled(app.lines[idx].clone(), style),
-        ]));
+        
+        // Apply syntax highlighting
+        let highlighted = syntax_highlight(&app.lines[idx]);
+        let mut line_spans = vec![Span::styled(format!("{marker}{lineno:>gutter$} "), Style::default().fg(Color::DarkGray))];
+        
+        // Apply selection/cursor style to highlighted spans
+        if selected {
+            for span in highlighted {
+                line_spans.push(Span::styled(span.content, style));
+            }
+        } else if idx == app.cursor {
+            for span in highlighted {
+                line_spans.push(Span::styled(span.content, span.style.patch(style)));
+            }
+        } else {
+            for span in highlighted {
+                line_spans.push(span);
+            }
+        }
+        
+        body_lines.push(Line::from(line_spans));
     }
     frame.render_widget(Paragraph::new(body_lines), body_area);
 
@@ -288,11 +429,68 @@ fn render(frame: &mut Frame, app: &mut App) {
     if let Some(input_area) = input_area {
         let note: String = app.note.iter().collect();
         let input = Paragraph::new(note.as_str())
-            .block(Block::bordered().title("Comment — Esc to save · Enter for newline"))
+            .block(Block::bordered().title("Comment — Esc to save · Ctrl+Q cancel · Enter for newline"))
             .wrap(Wrap { trim: false });
         frame.render_widget(input, input_area);
         let cursor_x = input_area.x + 1 + app.note_cursor as u16;
         let cursor_y = input_area.y + 1;
         frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(1)), cursor_y));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    #[test]
+    fn syntax_highlight_empty_line() {
+        let spans = syntax_highlight("");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "");
+    }
+
+    #[test]
+    fn syntax_highlight_keyword() {
+        let spans = syntax_highlight("fn");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "fn");
+        // Check style has cyan color
+        assert!(spans[0].style.fg == Some(Color::Cyan));
+    }
+
+    #[test]
+    fn syntax_highlight_keyword_in_line() {
+        let spans = syntax_highlight("fn main()");
+        assert!(spans.len() >= 1);
+        // First span should be the keyword
+        assert_eq!(spans[0].content, "fn");
+    }
+
+    #[test]
+    fn syntax_highlight_string() {
+        let spans = syntax_highlight("\"hello\"");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "\"hello\"");
+        // Check style has green color
+        assert!(spans[0].style.fg == Some(Color::Green));
+    }
+
+    #[test]
+    fn syntax_highlight_comment() {
+        let spans = syntax_highlight("// comment");
+        assert!(spans.len() >= 1);
+        // Should have a span with dark gray color
+        let has_comment = spans.iter().any(|s| s.style.fg == Some(Color::DarkGray));
+        assert!(has_comment, "Should find comment span");
+    }
+
+    #[test]
+    fn syntax_highlight_mixed() {
+        let spans = syntax_highlight("fn test() { // comment");
+        assert!(spans.len() >= 1);
+        // Should have at least one keyword
+        let has_keyword = spans.iter().any(|s| s.content == "fn");
+        assert!(has_keyword, "Should find fn keyword");
     }
 }
