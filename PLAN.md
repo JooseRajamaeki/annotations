@@ -78,3 +78,22 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 - 17:22 — Fixed `sha256_hex`: sha2 0.11 returns `GenericArray` without `LowerHex`, switched to manual byte formatting; all 7 unit tests pass
 - 17:24 — End-to-end batch mode test passed: `annotator src/main.rs --lines 1-5 --note "test"` produced valid `<UUID>.md` with file, lines, git_commit (unavailable), content_sha256, created_at, and note
 - 17:30 — Updated PLAN.md as implementation log
+
+## Feedback from User Testing
+
+Issues and feature requests collected from annotation files created during testing:
+
+### UX Improvements (Addressed)
+- **Visual mode key**: Changed from `Shift+V` to lowercase `v` (no Shift required)
+- **Output location visibility**: Added `saves to: <output_dir>` in the header
+- **Help text**: Clarified "V paint multiple lines" in the status bar
+
+### UX Improvements (Pending)
+- **Cancel comment**: Add ability to discard a comment without saving (e.g., `Ctrl+q` in editing mode)
+- **Syntax highlighting**: Add basic Rust syntax coloring for keywords, strings, comments
+
+### Feature Requests (Future)
+- Support commenting entire directories or paths (recursive annotation)
+- Built-in file selection/navigation
+- Configurable hash scope (file vs. line range)
+- Special "/exit" command to cancel editing without saving
