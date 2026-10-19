@@ -86,17 +86,42 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 
 ## Feedback from User Testing
 
-Issues and feature requests collected from annotation files created during testing:
+Issues and feature requests collected from annotation files in `annotations/`
+(source annotation ID prefix in brackets).
+
+### Open issues
+- **Hash scope was misunderstood** [`41ee6bdc`, follow-up to `6e12dd0d`]: the
+  `--hash-scope file|range` option is not what was asked for. Intended behavior:
+  when annotating a file or lines, always hash the *whole file*, so a dirty
+  working tree that deviates from the recorded git commit can be detected. For
+  directory/path annotations the hash is non-trivial (it would have to cover the
+  whole path's contents, which may be large) — needs a design decision.
+- **Line wrapping in the comment box** [`437fa259`]: text that goes past the
+  screen width overflows instead of wrapping. (The editor `Paragraph` has
+  `Wrap` set, but the cursor position in `src/app.rs` ignores wrapping and
+  newlines, and the input area height is fixed.)
+- **Visual mode key still `Shift+V`** [`2792dba9`]: previously listed as
+  addressed, but `src/app.rs` still binds `KeyCode::Char('V')` and the status bar
+  says "V paint multiple lines". Lowercase `v` is not implemented.
+- **Directory annotation produces one annotation per file** [`6e12dd0d`;
+  evidence `03fb2d0f`, `4ef8b1af`, `a879f431`]: running `--path` without
+  `--note` created three per-file annotations with empty comments covering whole
+  files. The request was to comment a directory/path as a unit; also an empty
+  note should probably not be saved (the TUI already refuses empty comments).
 
 ### UX Improvements (Addressed)
-- **Visual mode key**: Changed from `Shift+V` to lowercase `v` (no Shift required)
-- **Output location visibility**: Added `saves to: <output_dir>` in the header
-- **Help text**: Clarified "V paint multiple lines" in the status bar
-- **Cancel comment**: Added `Ctrl+Q` in editing mode to discard a comment without saving
-- **Syntax highlighting**: Added basic Rust syntax coloring for keywords (fn, let, pub, etc.), strings, and comments (line and block)
+- **Output location visibility** [`9e367b20`]: Added `saves to: <output_dir>` in the header
+- **Help text** [`9e367b20`]: Clarified "V paint multiple lines" in the status bar
+- **Cancel comment** [`5b79496a`]: Added `Ctrl+Q` in editing mode to discard a comment without saving
+  (requested as a special `/exit` command; `Ctrl+Q` chosen as more idiomatic for a TUI)
+- **Syntax highlighting** [`9e367b20`]: Added basic Rust syntax coloring for keywords (fn, let, pub, etc.), strings, and comments (line and block)
 
 ### Feature Requests (Addressed)
-- **Support commenting entire directories or paths**: Implemented `--path` CLI flag for recursive annotation of directories
-- **Built-in file selection/navigation**: Implemented file browser mode in TUI with `j/k` navigation, `Enter` to select, `h/Left` to go to parent
-- **Configurable hash scope**: Implemented `--hash-scope` CLI flag with `file` (default) or `range` options
-- **Special "/exit" command**: Implemented as `Ctrl+Q` instead, which is more idiomatic for TUI
+- **Support commenting entire directories or paths** [`6e12dd0d`]: Implemented `--path` CLI flag
+  for recursive annotation of directories (but see open issue above)
+- **Built-in file selection/navigation** [`b3ef44ab`]: Implemented file browser mode in TUI with
+  `j/k` navigation, `Enter` to select, `h/Left` to go to parent
+
+### Test artifacts (no action)
+- [`53c8ebe2`, `bf5e6bb4`]: "test batch mode" — batch-mode smoke tests
+- [`03fb2d0f`, `4ef8b1af`, `a879f431`]: empty comments from a `--path` test run
