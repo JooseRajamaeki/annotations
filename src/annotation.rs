@@ -6,22 +6,35 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Hash scope determines what content is hashed
+/// What an annotation is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HashScope {
-    /// Hash the entire file content
+pub enum Scope {
+    /// A line range of a file, 1-based inclusive.
+    Lines(usize, usize),
+    /// A whole file.
     File,
-    /// Hash only the selected line range
-    LineRange,
+    /// A whole directory (recursive).
+    Directory,
 }
 
-/// A single annotation: a comment tied to a line range of a file,
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::Lines(..) => "lines",
+            Scope::File => "file",
+            Scope::Directory => "directory",
+        }
+    }
+}
+
+/// A single annotation: a comment tied to a line range, file or directory,
 /// plus the metadata collected at save time.
 pub struct Annotation {
-    pub file: PathBuf,
-    pub line_start: usize,
-    pub line_end: usize,
+    pub path: PathBuf,
+    pub scope: Scope,
     pub git_commit: Option<String>,
+    /// For files and line ranges: SHA-256 of the whole file.
+    /// For directories: SHA-256 of a `sha256sum`-style manifest of its files.
     pub content_sha256: String,
     pub created_at: String,
     pub note: String,
@@ -33,15 +46,22 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// HEAD commit of the git repo containing `file`, if any.
-fn git_commit(file: &Path) -> Option<String> {
-    let dir = match file.parent() {
+/// Directory to run git in for `path`: the directory itself, or a file's parent.
+fn git_dir(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+    match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
-    };
+    }
+}
+
+/// HEAD commit of the git repo containing `path`, if any.
+fn git_commit(path: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(&dir)
+        .current_dir(git_dir(path))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -55,7 +75,67 @@ fn git_commit(file: &Path) -> Option<String> {
     }
 }
 
+/// Files under `dir`, relative to it. Inside a git repo this is the tracked
+/// plus untracked-but-not-ignored files (so `target/` etc. are skipped);
+/// otherwise a recursive walk that skips hidden entries.
+fn list_files(dir: &Path) -> Vec<PathBuf> {
+    let git = Command::new("git")
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."])
+        .current_dir(dir)
+        .output();
+    let mut files: Vec<PathBuf> = match git {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        _ => {
+            let mut files = Vec::new();
+            walk(dir, Path::new(""), &mut files);
+            files
+        }
+    };
+    files.sort();
+    files.dedup();
+    files
+}
+
+fn walk(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root.join(rel)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let rel_path = rel.join(&name);
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => walk(root, &rel_path, out),
+            Ok(t) if t.is_file() => out.push(rel_path),
+            _ => {}
+        }
+    }
+}
+
+/// Hash of a directory's contents: SHA-256 of a manifest with one
+/// `<file sha256>  <relative path>` line per file, sorted by path (the same
+/// format `sha256sum` prints). Files listed by git but missing on disk
+/// (deleted in the working tree) get `deleted` in place of a hash.
+pub fn directory_sha256(dir: &Path) -> String {
+    let mut manifest = String::new();
+    for rel in list_files(dir) {
+        let hash = match fs::read(dir.join(&rel)) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(_) => "deleted".to_string(),
+        };
+        manifest.push_str(&format!("{hash}  {}\n", rel.display()));
+    }
+    sha256_hex(manifest.as_bytes())
+}
+
 impl Annotation {
+    /// Annotation for a line range of `file`, whose full text is `contents`.
     pub fn collect(
         file: &Path,
         contents: &str,
@@ -64,9 +144,8 @@ impl Annotation {
         note: &str,
     ) -> Annotation {
         Annotation {
-            file: file.to_path_buf(),
-            line_start,
-            line_end,
+            path: file.to_path_buf(),
+            scope: Scope::Lines(line_start, line_end),
             git_commit: git_commit(file),
             content_sha256: sha256_hex(contents.as_bytes()),
             created_at: Utc::now().to_rfc3339(),
@@ -74,83 +153,39 @@ impl Annotation {
         }
     }
 
+    /// Annotation for a whole file or a whole directory.
+    pub fn collect_for_path(path: &Path, note: &str) -> std::io::Result<Annotation> {
+        let (scope, content_sha256) = if path.is_dir() {
+            (Scope::Directory, directory_sha256(path))
+        } else {
+            (Scope::File, sha256_hex(&fs::read(path)?))
+        };
+        Ok(Annotation {
+            path: path.to_path_buf(),
+            scope,
+            git_commit: git_commit(path),
+            content_sha256,
+            created_at: Utc::now().to_rfc3339(),
+            note: note.to_string(),
+        })
+    }
+
     /// The on-disk file name: a freshly generated UUID plus `.md`.
     pub fn file_name(&self) -> String {
         format!("{}.md", Uuid::new_v4())
     }
 
-    /// Create an annotation for a path (file or directory)
-    pub fn collect_for_path(
-        path: &Path,
-        note: &str,
-        hash_scope: HashScope,
-    ) -> Vec<Annotation> {
-        let mut annotations = Vec::new();
-        
-        if path.is_dir() {
-            // Recursively find all files in the directory
-            if let Ok(entries) = fs::read_dir(path) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let entry_path = entry.path();
-                        if entry_path.is_file() {
-                            // For directories, we annotate each file with the full path
-                            // and use line range 1-1 (whole file)
-                            if let Ok(contents) = fs::read_to_string(&entry_path) {
-                                let annotation = Annotation {
-                                    file: entry_path.clone(),
-                                    line_start: 1,
-                                    line_end: contents.lines().count(),
-                                    git_commit: git_commit(&entry_path),
-                                    content_sha256: match hash_scope {
-                                        HashScope::File => sha256_hex(contents.as_bytes()),
-                                        HashScope::LineRange => {
-                                            let start = 0.min(contents.len());
-                                            let end = contents.len();
-                                            sha256_hex(&contents.as_bytes()[start..end])
-                                        }
-                                    },
-                                    created_at: Utc::now().to_rfc3339(),
-                                    note: note.to_string(),
-                                };
-                                annotations.push(annotation);
-                            }
-                        } else if entry_path.is_dir() {
-                            // Recursively process subdirectories
-                            let sub_annotations = Annotation::collect_for_path(&entry_path, note, hash_scope);
-                            annotations.extend(sub_annotations);
-                        }
-                    }
-                }
-            }
-        } else {
-            // Single file
-            if let Ok(contents) = fs::read_to_string(path) {
-                let total_lines = contents.lines().count();
-                let annotation = Annotation {
-                    file: path.to_path_buf(),
-                    line_start: 1,
-                    line_end: total_lines,
-                    git_commit: git_commit(path),
-                    content_sha256: match hash_scope {
-                        HashScope::File => sha256_hex(contents.as_bytes()),
-                        HashScope::LineRange => sha256_hex(contents.as_bytes()),
-                    },
-                    created_at: Utc::now().to_rfc3339(),
-                    note: note.to_string(),
-                };
-                annotations.push(annotation);
-            }
-        }
-        
-        annotations
-    }
-
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("# Annotation\n\n");
-        md.push_str(&format!("- file: `{}`\n", self.file.display()));
-        md.push_str(&format!("- lines: {}-{}\n", self.line_start, self.line_end));
+        md.push_str(&format!("- scope: {}\n", self.scope.label()));
+        match self.scope {
+            Scope::Directory => md.push_str(&format!("- path: `{}`\n", self.path.display())),
+            _ => md.push_str(&format!("- file: `{}`\n", self.path.display())),
+        }
+        if let Scope::Lines(start, end) = self.scope {
+            md.push_str(&format!("- lines: {start}-{end}\n"));
+        }
         match &self.git_commit {
             Some(commit) => md.push_str(&format!("- git_commit: `{commit}`\n")),
             None => md.push_str("- git_commit: unavailable\n"),
@@ -162,9 +197,17 @@ impl Annotation {
         md.push('\n');
         md
     }
+
+    /// Write to `<output_dir>/<UUID>.md` and return the written path.
+    fn write(&self, output_dir: &Path) -> std::io::Result<PathBuf> {
+        fs::create_dir_all(output_dir)?;
+        let path = output_dir.join(self.file_name());
+        fs::write(&path, self.to_markdown())?;
+        Ok(path)
+    }
 }
 
-/// Build an annotation for `file` and write it to `<output_dir>/<UUID>.md`.
+/// Build a line-range annotation for `file` and write it to `<output_dir>/<UUID>.md`.
 /// Returns the path of the written file.
 pub fn save_annotation(
     file: &Path,
@@ -174,33 +217,13 @@ pub fn save_annotation(
     note: &str,
     output_dir: &Path,
 ) -> std::io::Result<PathBuf> {
-    let annotation = Annotation::collect(file, contents, line_start, line_end, note);
-    fs::create_dir_all(output_dir)?;
-    let path = output_dir.join(annotation.file_name());
-    fs::write(&path, annotation.to_markdown())?;
-    Ok(path)
+    Annotation::collect(file, contents, line_start, line_end, note).write(output_dir)
 }
 
-/// Save annotations for an entire path (file or directory)
-/// Returns the paths of all written annotation files.
-pub fn save_path_annotation(
-    path: &Path,
-    note: &str,
-    output_dir: &Path,
-    hash_scope: HashScope,
-) -> std::io::Result<Vec<PathBuf>> {
-    let annotations = Annotation::collect_for_path(path, note, hash_scope);
-    let mut saved_paths = Vec::new();
-    
-    fs::create_dir_all(output_dir)?;
-    
-    for annotation in annotations {
-        let file_path = output_dir.join(annotation.file_name());
-        fs::write(&file_path, annotation.to_markdown())?;
-        saved_paths.push(file_path);
-    }
-    
-    Ok(saved_paths)
+/// Build a single annotation for a whole file or directory and write it to
+/// `<output_dir>/<UUID>.md`. Returns the path of the written file.
+pub fn save_path_annotation(path: &Path, note: &str, output_dir: &Path) -> std::io::Result<PathBuf> {
+    Annotation::collect_for_path(path, note)?.write(output_dir)
 }
 
 #[cfg(test)]
@@ -218,15 +241,15 @@ mod tests {
     #[test]
     fn markdown_contains_all_metadata() {
         let a = Annotation {
-            file: PathBuf::from("src/foo.rs"),
-            line_start: 3,
-            line_end: 7,
+            path: PathBuf::from("src/foo.rs"),
+            scope: Scope::Lines(3, 7),
             git_commit: Some("abc123".to_string()),
             content_sha256: "deadbeef".to_string(),
             created_at: "2026-10-19T00:00:00+00:00".to_string(),
             note: "this looks wrong".to_string(),
         };
         let md = a.to_markdown();
+        assert!(md.contains("- scope: lines"));
         assert!(md.contains("- file: `src/foo.rs`"));
         assert!(md.contains("- lines: 3-7"));
         assert!(md.contains("- git_commit: `abc123`"));
@@ -239,9 +262,8 @@ mod tests {
     #[test]
     fn markdown_marks_missing_git_commit() {
         let a = Annotation {
-            file: PathBuf::from("foo.rs"),
-            line_start: 1,
-            line_end: 1,
+            path: PathBuf::from("foo.rs"),
+            scope: Scope::Lines(1, 1),
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
@@ -253,9 +275,8 @@ mod tests {
     #[test]
     fn file_name_is_uuid_md() {
         let a = Annotation {
-            file: PathBuf::from("foo.rs"),
-            line_start: 1,
-            line_end: 1,
+            path: PathBuf::from("foo.rs"),
+            scope: Scope::Lines(1, 1),
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
@@ -322,6 +343,73 @@ mod tests {
         // /tmp is not a git repo on a typical machine; even if some parent were,
         // the test only asserts the Option shape, not the value.
         let _ = git_commit(&file);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_annotation_hashes_whole_file_without_lines() {
+        let dir = std::env::temp_dir().join(format!("annotator-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+
+        let a = Annotation::collect_for_path(&file, "whole file").unwrap();
+        assert_eq!(a.scope, Scope::File);
+        assert_eq!(a.content_sha256, sha256_hex(b"fn a() {}\nfn b() {}\n"));
+        let md = a.to_markdown();
+        assert!(md.contains("- scope: file"));
+        assert!(md.contains("- file: `"));
+        assert!(!md.contains("- lines:"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_annotation_is_single_and_hash_tracks_contents() {
+        let dir = std::env::temp_dir().join(format!("annotator-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.txt"), "a\n").unwrap();
+        fs::write(dir.join("sub/b.txt"), "b\n").unwrap();
+        fs::write(dir.join(".hidden"), "ignored\n").unwrap();
+
+        let a = Annotation::collect_for_path(&dir, "whole dir").unwrap();
+        assert_eq!(a.scope, Scope::Directory);
+        let manifest = format!(
+            "{}  a.txt\n{}  sub/b.txt\n",
+            sha256_hex(b"a\n"),
+            sha256_hex(b"b\n")
+        );
+        assert_eq!(a.content_sha256, sha256_hex(manifest.as_bytes()));
+        let md = a.to_markdown();
+        assert!(md.contains("- scope: directory"));
+        assert!(md.contains("- path: `"));
+        assert!(!md.contains("- lines:"));
+
+        fs::write(dir.join("sub/b.txt"), "changed\n").unwrap();
+        assert_ne!(directory_sha256(&dir), a.content_sha256);
+
+        let out = dir.join("out");
+        save_path_annotation(&dir, "whole dir", &out).unwrap();
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_hash_respects_gitignore_inside_repo() {
+        let dir = std::env::temp_dir().join(format!("annotator-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(dir.join("target")).unwrap();
+        fs::write(dir.join(".gitignore"), "/target\n").unwrap();
+        fs::write(dir.join("a.txt"), "a\n").unwrap();
+        fs::write(dir.join("target/big.bin"), "build output\n").unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&dir).output().unwrap();
+
+        let before = directory_sha256(&dir);
+        fs::write(dir.join("target/big.bin"), "rebuilt\n").unwrap();
+        assert_eq!(directory_sha256(&dir), before, "ignored files must not affect the hash");
+        fs::write(dir.join("a.txt"), "edited\n").unwrap();
+        assert_ne!(directory_sha256(&dir), before);
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

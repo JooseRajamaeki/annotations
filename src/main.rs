@@ -4,7 +4,7 @@ mod app;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use annotation::{save_annotation, save_path_annotation, HashScope};
+use annotation::{save_annotation, save_path_annotation};
 
 struct Cli {
     file: Option<PathBuf>,
@@ -12,7 +12,6 @@ struct Cli {
     output_dir: PathBuf,
     lines: Option<(usize, usize)>,
     note: Option<String>,
-    hash_scope: HashScope,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -22,7 +21,6 @@ fn parse_args() -> Result<Cli, String> {
     let mut output_dir = PathBuf::from("annotations");
     let mut lines: Option<(usize, usize)> = None;
     let mut note: Option<String> = None;
-    let mut hash_scope = HashScope::File;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -47,14 +45,6 @@ fn parse_args() -> Result<Cli, String> {
             "--path" => {
                 path = Some(PathBuf::from(args.next().ok_or("--path requires a value")?));
             }
-            "--hash-scope" => {
-                let scope = args.next().ok_or("--hash-scope requires a value (file or range)")?;
-                hash_scope = match scope.as_str() {
-                    "file" => HashScope::File,
-                    "range" | "line" | "lines" => HashScope::LineRange,
-                    other => return Err(format!("invalid hash scope: {other} (expected file or range)")),
-                };
-            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -66,18 +56,27 @@ fn parse_args() -> Result<Cli, String> {
         }
     }
 
-    // Validate that we have either a file or a path
-    if file.is_none() && path.is_none() {
-        return Err("usage: annotator <file> [--lines A-B --note TEXT] [--output-dir DIR] [--hash-scope file|range]".into());
+    if path.is_some() {
+        if file.is_some() {
+            return Err("give either <file> or --path, not both".into());
+        }
+        if lines.is_some() {
+            return Err("--lines cannot be used with --path (a path annotation covers the whole file or directory)".into());
+        }
+        if note.is_none() {
+            return Err("--path requires --note TEXT".into());
+        }
     }
-    
+    if note.as_deref().is_some_and(|n| n.trim().is_empty()) {
+        return Err("--note must not be empty".into());
+    }
+
     Ok(Cli {
         file,
         path,
         output_dir,
         lines,
         note,
-        hash_scope,
     })
 }
 
@@ -88,14 +87,13 @@ fn print_help() {
     eprintln!("  annotator                              interactive file browser");
     eprintln!("  annotator <file>                       interactive TUI");
     eprintln!("  annotator <file> --lines A-B --note TEXT   save an annotation without the TUI");
-    eprintln!("  annotator --path <path> --note TEXT        annotate all files in a path (recursive)");
+    eprintln!("  annotator --path <path> --note TEXT        annotate a whole file or directory");
     eprintln!();
     eprintln!("options:");
     eprintln!("  --lines A-B       line range to annotate (1-based, inclusive)");
     eprintln!("  --note TEXT       comment text (batch mode)");
-    eprintln!("  --path PATH       path or directory to annotate (recursive if directory)");
+    eprintln!("  --path PATH       file or directory to annotate as a whole (one annotation)");
     eprintln!("  --output-dir DIR  where to write <UUID>.md files (default: ./annotations)");
-    eprintln!("  --hash-scope SCOPE hash scope: file (default) or range");
 }
 
 fn main() -> ExitCode {
@@ -108,17 +106,12 @@ fn main() -> ExitCode {
         }
     };
 
-    // Handle path mode (recursive annotation of directories)
+    // Path mode: one annotation for a whole file or directory
     if let Some(path) = cli.path {
-        let note = cli.note.as_deref().unwrap_or("");
-        match save_path_annotation(&path, note, &cli.output_dir, cli.hash_scope) {
-            Ok(paths) => {
-                for p in &paths {
-                    println!("saved annotation: {}", p.display());
-                }
-                if paths.is_empty() {
-                    eprintln!("warning: no files found in path {}", path.display());
-                }
+        let note = cli.note.as_deref().unwrap_or_default();
+        match save_path_annotation(&path, note.trim(), &cli.output_dir) {
+            Ok(saved) => {
+                println!("saved annotation: {}", saved.display());
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
@@ -145,7 +138,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
             let end = end.min(total_lines);
-            match save_annotation(&file, &contents, start, end, &note, &cli.output_dir) {
+            match save_annotation(&file, &contents, start, end, note.trim(), &cli.output_dir) {
                 Ok(path) => {
                     println!("saved annotation: {}", path.display());
                     return ExitCode::SUCCESS;

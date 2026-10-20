@@ -8,7 +8,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::annotation::save_annotation;
@@ -182,6 +182,64 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
     spans
 }
 
+/// The comment text laid out in rows of at most `width` characters.
+struct WrappedNote {
+    rows: Vec<String>,
+    /// Cursor position as (row, column) within `rows`.
+    cursor: (usize, usize),
+}
+
+/// Word-wrap `note` to `width` columns, breaking after the last space in a
+/// row when there is one and mid-word otherwise. Explicit newlines always
+/// start a new row. Also maps the char index `cursor` to its (row, column).
+fn wrap_note(note: &[char], cursor: usize, width: usize) -> WrappedNote {
+    let width = width.max(1);
+    // Rows as char index ranges into `note`, newlines excluded.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    let mut last_space: Option<usize> = None;
+    let mut i = 0;
+    while i < note.len() {
+        if note[i] == '\n' {
+            ranges.push((start, i));
+            start = i + 1;
+            last_space = None;
+            i += 1;
+            continue;
+        }
+        if i - start == width {
+            // Row is full. A space here is the break itself (it hangs past the
+            // edge and is not drawn); otherwise break after the last space, or
+            // mid-word if there is none, and look at char `i` again.
+            let end = if note[i] == ' ' { i + 1 } else { last_space.map_or(i, |sp| sp + 1) };
+            ranges.push((start, end));
+            start = end;
+            last_space = (start..i).rev().find(|&k| note[k] == ' ');
+            i = i.max(end);
+            continue;
+        }
+        if note[i] == ' ' {
+            last_space = Some(i);
+        }
+        i += 1;
+    }
+    ranges.push((start, note.len()));
+
+    // The cursor belongs to the last row starting at or before it, so at a
+    // soft break it sits at the start of the next row.
+    let row = ranges.iter().rposition(|&(s, _)| s <= cursor).unwrap_or(0);
+    let mut cursor_pos = (row, cursor - ranges[row].0);
+    let mut rows: Vec<String> = ranges.iter().map(|&(s, e)| note[s..e].iter().take(width).collect()).collect();
+    if cursor_pos.1 >= width {
+        // Cursor after a full row: show it where the next char will go.
+        cursor_pos = (row + 1, 0);
+        if rows.len() == row + 1 {
+            rows.push(String::new());
+        }
+    }
+    WrappedNote { rows, cursor: cursor_pos }
+}
+
 impl App {
     pub fn new(file: &Path, contents: &str, output_dir: &Path) -> App {
         let lines: Vec<String> = contents.lines().map(str::to_string).collect();
@@ -294,6 +352,8 @@ impl App {
 
     fn save(&mut self) {
         let note: String = self.note.iter().collect::<String>().trim().to_string();
+        // Read the painted range before clearing the anchor below.
+        let (start, end) = self.selection();
         self.mode = Mode::Normal;
         self.note.clear();
         self.note_cursor = 0;
@@ -302,7 +362,6 @@ impl App {
             self.status = "empty comment — nothing saved".to_string();
             return;
         }
-        let (start, end) = self.selection();
         if let Some(file) = &self.file {
             match save_annotation(file, &self.contents, start, end, &note, &self.output_dir) {
                 Ok(path) => self.status = format!("saved: {}", path.display()),
@@ -321,7 +380,7 @@ impl App {
                 KeyCode::Char('k') | KeyCode::Up => self.move_cursor(-1),
                 KeyCode::Char('g') => self.cursor = 0,
                 KeyCode::Char('G') => self.cursor = self.lines.len().saturating_sub(1),
-                KeyCode::Char('V') => {
+                KeyCode::Char('v') | KeyCode::Char('V') => {
                     self.anchor = Some(self.cursor);
                     self.mode = Mode::Visual;
                 }
@@ -329,7 +388,7 @@ impl App {
                 _ => {}
             },
             Mode::Visual => match key.code {
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('V') => {
                     self.anchor = None;
                     self.mode = Mode::Normal;
                 }
@@ -497,12 +556,20 @@ fn render(frame: &mut Frame, app: &mut App) {
     let editing = app.mode == Mode::Editing;
     let file_browser = app.mode == Mode::FileBrowser;
 
+    // The comment box grows with its wrapped text, up to half the screen.
+    let wrapped_note = editing.then(|| {
+        let inner_width = area.width.saturating_sub(2).max(1) as usize;
+        wrap_note(&app.note, app.note_cursor, inner_width)
+    });
+    let max_note_rows = (area.height / 2).saturating_sub(2).max(1) as usize;
+    let note_rows = wrapped_note.as_ref().map_or(1, |w| w.rows.len().clamp(1, max_note_rows));
+
     let chunks = if editing {
         Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(note_rows as u16 + 2),
         ])
         .split(area)
     } else if file_browser {
@@ -622,7 +689,7 @@ fn render(frame: &mut Frame, app: &mut App) {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                "   j/k move · V paint multiple lines · c comment · Ctrl+Q cancel · q quit",
+                "   j/k move · v paint multiple lines · c comment · Ctrl+Q cancel · q quit",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
@@ -686,15 +753,17 @@ fn render(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(status), status_area);
 
         // Note editor
-        if let Some(input_area) = input_area {
-            let note: String = app.note.iter().collect();
-            let input = Paragraph::new(note.as_str())
-                .block(Block::bordered().title("Comment — Esc to save · Ctrl+Q cancel · Enter for newline"))
-                .wrap(Wrap { trim: false });
+        if let (Some(input_area), Some(wrapped)) = (input_area, wrapped_note) {
+            // Scroll so the cursor row stays visible.
+            let (cursor_row, cursor_col) = wrapped.cursor;
+            let scroll = cursor_row.saturating_sub(note_rows - 1);
+            let lines: Vec<Line> = wrapped.rows.into_iter().skip(scroll).take(note_rows).map(Line::from).collect();
+            let input = Paragraph::new(lines)
+                .block(Block::bordered().title("Comment — Esc to save · Ctrl+Q cancel · Enter for newline"));
             frame.render_widget(input, input_area);
-            let cursor_x = input_area.x + 1 + app.note_cursor as u16;
-            let cursor_y = input_area.y + 1;
-            frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(1)), cursor_y));
+            let cursor_x = input_area.x + 1 + cursor_col as u16;
+            let cursor_y = input_area.y + 1 + (cursor_row - scroll) as u16;
+            frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(2)), cursor_y));
         }
     }
 }
@@ -753,5 +822,270 @@ mod tests {
         // Should have at least one keyword
         let has_keyword = spans.iter().any(|s| s.content == "fn");
         assert!(has_keyword, "Should find fn keyword");
+    }
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn wrap_note_breaks_at_spaces() {
+        let note = chars("hello world foo");
+        let w = wrap_note(&note, note.len(), 11);
+        assert_eq!(w.rows, vec!["hello world", "foo"]);
+        assert_eq!(w.cursor, (1, 3));
+    }
+
+    #[test]
+    fn wrap_note_breaks_long_words() {
+        let note = chars("abcdefghij");
+        let w = wrap_note(&note, 0, 4);
+        assert_eq!(w.rows, vec!["abcd", "efgh", "ij"]);
+        assert_eq!(w.cursor, (0, 0));
+    }
+
+    #[test]
+    fn wrap_note_respects_newlines() {
+        let note = chars("ab\ncd");
+        let w = wrap_note(&note, 2, 10);
+        assert_eq!(w.rows, vec!["ab", "cd"]);
+        assert_eq!(w.cursor, (0, 2));
+        assert_eq!(wrap_note(&note, 3, 10).cursor, (1, 0));
+    }
+
+    #[test]
+    fn wrap_note_cursor_after_full_row_moves_to_next_row() {
+        let note = chars("abcd");
+        let w = wrap_note(&note, 4, 4);
+        assert_eq!(w.rows, vec!["abcd", ""]);
+        assert_eq!(w.cursor, (1, 0));
+    }
+
+    #[test]
+    fn wrap_note_rows_never_exceed_width() {
+        let note = chars("the quick brown fox jumps over the lazy dog again and again");
+        for width in 1..20 {
+            let w = wrap_note(&note, note.len(), width);
+            assert!(w.rows.iter().all(|r| r.chars().count() <= width), "width {width}: {:?}", w.rows);
+            let no_spaces = |s: String| s.replace(' ', "");
+            assert_eq!(no_spaces(w.rows.concat()), no_spaces(note.iter().collect()));
+        }
+    }
+
+    #[test]
+    fn lowercase_v_toggles_visual_mode() {
+        let mut app = App::new(Path::new("x.rs"), "a\nb\n", Path::new("out"));
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.mode == Mode::Visual);
+        assert_eq!(app.anchor, Some(0));
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.selection(), (1, 2));
+        app.handle_key(KeyEvent::from(KeyCode::Char('v')));
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.anchor, None);
+    }
+
+    // --- Key handling and rendering, driven through `handle_key` and `render`. ---
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("annotator-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::from(code));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, if c == '\n' { KeyCode::Enter } else { KeyCode::Char(c) });
+        }
+    }
+
+    fn saved_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir).map_or(Vec::new(), |d| d.map(|e| e.unwrap().path()).collect())
+    }
+
+    /// Render one frame into an in-memory terminal; returns screen rows and cursor.
+    fn draw(app: &mut App, width: u16, height: u16) -> (Vec<String>, (u16, u16)) {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let backend = terminal.backend();
+        let rows = backend
+            .buffer()
+            .content
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect())
+            .collect();
+        let pos = backend.cursor_position();
+        (rows, (pos.x, pos.y))
+    }
+
+    #[test]
+    fn esc_saves_painted_selection() {
+        let dir = temp_dir();
+        let file = dir.join("a.rs");
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let out = dir.join("out");
+        let mut app = App::new(&file, &fs::read_to_string(&file).unwrap(), &out);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.mode == Mode::Editing);
+        type_text(&mut app, "  looks off  ");
+        press(&mut app, KeyCode::Esc);
+
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.anchor, None);
+        assert!(app.status.starts_with("saved: "), "status: {}", app.status);
+        let files = saved_files(&out);
+        assert_eq!(files.len(), 1);
+        let md = fs::read_to_string(&files[0]).unwrap();
+        assert!(md.contains("- scope: lines"));
+        assert!(md.contains("- lines: 2-3"));
+        assert!(md.ends_with("## Comment\n\nlooks off\n"), "{md}");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ctrl_q_discards_comment() {
+        let dir = temp_dir();
+        let out = dir.join("out");
+        let mut app = App::new(Path::new("x.rs"), "a\n", &out);
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "never mind");
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.status, "comment discarded");
+        assert!(app.note.is_empty());
+        assert!(saved_files(&out).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plain_q_while_editing_is_text_not_quit() {
+        let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "q");
+        assert!(!app.should_quit);
+        assert_eq!(app.note, vec!['q']);
+    }
+
+    #[test]
+    fn empty_comment_is_not_saved() {
+        let dir = temp_dir();
+        let out = dir.join("out");
+        let mut app = App::new(Path::new("x.rs"), "a\n", &out);
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "  \n ");
+        press(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.status, "empty comment — nothing saved");
+        assert!(saved_files(&out).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn editor_cursor_movement_and_backspace() {
+        let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "ac");
+        press(&mut app, KeyCode::Left);
+        type_text(&mut app, "b");
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right); // already at end: stays
+        type_text(&mut app, "dx");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.note.iter().collect::<String>(), "abcd");
+        assert_eq!(app.note_cursor, 4);
+    }
+
+    #[test]
+    fn cursor_moves_are_clamped_to_file() {
+        let mut app = App::new(Path::new("x.rs"), "a\nb\nc\n", Path::new("out"));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.cursor, 0);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.cursor, 2);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.cursor, 2);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn selection_works_when_painting_upwards() {
+        let mut app = App::new(Path::new("x.rs"), "a\nb\nc\nd\n", Path::new("out"));
+        press(&mut app, KeyCode::Char('G'));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('k'));
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selection(), (2, 4));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selection(), (2, 2));
+    }
+
+    #[test]
+    fn header_shows_lowercase_v_hint_and_output_dir() {
+        let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("my-notes"));
+        let (rows, _) = draw(&mut app, 200, 10);
+        assert!(rows[0].contains("v paint multiple lines"), "{}", rows[0]);
+        assert!(rows[0].contains("saves to: my-notes"), "{}", rows[0]);
+    }
+
+    #[test]
+    fn comment_box_wraps_text_and_tracks_cursor() {
+        let mut app = App::new(Path::new("x.rs"), "fn main() {}\n", Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "aaaa bbbb cccc dddd eeee ffff gggg");
+        // 30 wide → 28 inner columns: the text needs two rows, so the box is
+        // 4 tall at the bottom of a 20 row screen (rows 16..=19).
+        let (rows, cursor) = draw(&mut app, 30, 20);
+        assert!(rows[16].starts_with("┌Comment"), "{:#?}", rows);
+        assert_eq!(rows[17], "│aaaa bbbb cccc dddd eeee    │");
+        assert_eq!(rows[18], "│ffff gggg                   │");
+        assert!(rows[19].starts_with("└"));
+        assert_eq!(cursor, (10, 18));
+        assert!(rows[2].contains("fn main() {}"), "file body still shown: {}", rows[2]);
+    }
+
+    #[test]
+    fn comment_box_scrolls_when_taller_than_half_the_screen() {
+        let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
+        // 12 rows high → at most 12/2 - 2 = 4 text rows, scrolled to the cursor.
+        let (rows, cursor) = draw(&mut app, 30, 12);
+        let shown: Vec<&str> = rows[7..11].iter().map(|r| r.trim_matches(['│', ' '])).collect();
+        assert_eq!(shown, ["l6", "l7", "l8", "l9"]);
+        assert!(rows[11].starts_with("└"));
+        assert_eq!(cursor, (3, 10));
+    }
+
+    #[test]
+    fn file_browser_lists_dirs_first_and_opens_files() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("zdir")).unwrap();
+        fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        let mut app = App::new_browser(&dir, Path::new("out"));
+        let names: Vec<&str> = app.browser_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["zdir", "a.rs"]);
+
+        press(&mut app, KeyCode::Enter); // into zdir
+        assert_eq!(app.browser_path, dir.join("zdir"));
+        press(&mut app, KeyCode::Char('h')); // back to parent
+        assert_eq!(app.browser_path, dir);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter); // open a.rs
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.file.as_deref(), Some(dir.join("a.rs").as_path()));
+        assert_eq!(app.lines, vec!["fn a() {}"]);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

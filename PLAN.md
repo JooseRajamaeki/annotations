@@ -22,25 +22,38 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   maps naturally to a vim-like visual selection in the terminal.
 - **Interaction model** (modal, vim-inspired):
   - `j`/`k` or arrows: move cursor
-  - `V`: enter visual (paint) mode, move to extend the selection
+  - `v`: enter visual (paint) mode, move to extend the selection (`v`/`Esc` again to stop)
   - `Enter` / `c`: write a note for the current selection
-  - Note editor: type text, `Esc` to save, `Enter` for newline
+  - Note editor: type text, `Esc` to save, `Ctrl+Q` to discard, `Enter` for newline;
+    text word-wraps and the box grows up to half the screen, then scrolls
   - `q`: quit
+  - No file argument: start in a file browser (`j/k`, `Enter`/`l` open, `h` parent)
+- **Scopes**: an annotation is about a line range (TUI or `<file> --lines A-B`),
+  a whole file (`--path FILE`) or a whole directory (`--path DIR`). A
+  directory gets one annotation, not one per file.
 - **Storage**: one Markdown file per annotation, named `<UUID>.md`, written to
   an `annotations/` directory in the current working directory (configurable via `--output-dir`).
 - **Metadata**: collected at save time:
   - `git rev-parse HEAD` of the repo containing the file (optional, if in a repo)
-  - SHA-256 of the file contents
-  - file path (as given)
-  - selected line range (start, end, 1-based)
+  - SHA-256 of the *whole* file, also for line ranges, so a working tree that
+    has drifted from `git_commit` can be detected
+  - for directories: SHA-256 of a manifest with one `<sha256>  <relative path>`
+    line per file, sorted by path — the same as
+    `git ls-files -co --exclude-standard | sort | xargs sha256sum | sha256sum`.
+    Inside a repo the file list is tracked + untracked-but-not-ignored files
+    (so `target/` is skipped, deleted files are listed as `deleted`); outside a
+    repo it is a recursive walk that skips hidden entries
+  - file/directory path (as given)
+  - selected line range (start, end, 1-based), for line annotations only
   - timestamp (UTC)
 - **Output format** (`<UUID>.md`):
 
   ```markdown
   # Annotation
 
-  - file: path/to/file.rs
-  - lines: 12-18
+  - scope: lines            (or: file, directory)
+  - file: path/to/file.rs   (directories: - path: path/to/dir)
+  - lines: 12-18            (only for scope: lines)
   - git_commit: <hash or "unavailable">
   - content_sha256: <hash>
   - created_at: <RFC3339 UTC>
@@ -67,6 +80,22 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 6. [x] Save annotation `<UUID>.md` with all metadata
 7. [x] End-to-end test: annotate a sample file, verify output file
 8. [x] Plan updated as implementation log
+9. [x] Fix issues from user-testing annotations (see below)
+10. [x] Test suite: unit, TUI (in-memory terminal) and CLI integration tests
+
+## Testing
+
+`cargo test` runs:
+
+- `src/annotation.rs` — hashing, Markdown output, git detection, file and
+  directory annotations, `.gitignore`-aware directory hash.
+- `src/app.rs` — syntax highlighting, comment wrapping (`wrap_note`), key
+  handling (painting, saving, `Ctrl+Q` discard, empty comments, file browser)
+  and rendering into ratatui's `TestBackend` (comment box wrap/grow/scroll and
+  cursor placement, header hints).
+- `tests/cli.rs` — runs the built binary in temp dirs and git repos: all
+  metadata fields, dirty-tree detection, line-range clamping, `--path` for
+  files and directories, and every argument/runtime error path.
 
 ## Implementation log
 
@@ -83,6 +112,13 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 - 20:48 — Implemented `--path` flag for recursive directory annotation
 - 20:48 — Implemented `--hash-scope` flag for configurable hash scope (file/range)
 - 20:48 — Added file browser UI with navigation (j/k move, Enter select, h/Left parent)
+- 2026-10-20 — Fixed open issues from annotations: removed `--hash-scope` (whole-file hash always),
+  `--path` now writes one annotation (scope file/directory, manifest hash for directories) and
+  requires a non-empty `--note`; lowercase `v` paints; comment box word-wraps, grows and scrolls
+- 2026-10-20 — Added TUI and CLI integration tests. They found two bugs, now fixed: saving from
+  the TUI cleared the painted selection before reading it (multi-line selections were saved as
+  the cursor line only), and running with no arguments printed usage instead of opening the
+  file browser
 
 ## Feedback from User Testing
 
@@ -90,35 +126,24 @@ Issues and feature requests collected from annotation files in `annotations/`
 (source annotation ID prefix in brackets).
 
 ### Open issues
-- **Hash scope was misunderstood** [`41ee6bdc`, follow-up to `6e12dd0d`]: the
-  `--hash-scope file|range` option is not what was asked for. Intended behavior:
-  when annotating a file or lines, always hash the *whole file*, so a dirty
-  working tree that deviates from the recorded git commit can be detected. For
-  directory/path annotations the hash is non-trivial (it would have to cover the
-  whole path's contents, which may be large) — needs a design decision.
-- **Line wrapping in the comment box** [`437fa259`]: text that goes past the
-  screen width overflows instead of wrapping. (The editor `Paragraph` has
-  `Wrap` set, but the cursor position in `src/app.rs` ignores wrapping and
-  newlines, and the input area height is fixed.)
-- **Visual mode key still `Shift+V`** [`2792dba9`]: previously listed as
-  addressed, but `src/app.rs` still binds `KeyCode::Char('V')` and the status bar
-  says "V paint multiple lines". Lowercase `v` is not implemented.
-- **Directory annotation produces one annotation per file** [`6e12dd0d`;
-  evidence `03fb2d0f`, `4ef8b1af`, `a879f431`]: running `--path` without
-  `--note` created three per-file annotations with empty comments covering whole
-  files. The request was to comment a directory/path as a unit; also an empty
-  note should probably not be saved (the TUI already refuses empty comments).
+- None.
 
 ### UX Improvements (Addressed)
+- **Visual mode key** [`2792dba9`]: lowercase `v` starts/stops painting (`V` still works)
+- **Line wrapping in the comment box** [`437fa259`]: the editor word-wraps, grows up to half
+  the screen and then scrolls to keep the cursor visible
 - **Output location visibility** [`9e367b20`]: Added `saves to: <output_dir>` in the header
-- **Help text** [`9e367b20`]: Clarified "V paint multiple lines" in the status bar
+- **Help text** [`9e367b20`]: Clarified "v paint multiple lines" in the header
 - **Cancel comment** [`5b79496a`]: Added `Ctrl+Q` in editing mode to discard a comment without saving
   (requested as a special `/exit` command; `Ctrl+Q` chosen as more idiomatic for a TUI)
 - **Syntax highlighting** [`9e367b20`]: Added basic Rust syntax coloring for keywords (fn, let, pub, etc.), strings, and comments (line and block)
 
 ### Feature Requests (Addressed)
-- **Support commenting entire directories or paths** [`6e12dd0d`]: Implemented `--path` CLI flag
-  for recursive annotation of directories (but see open issue above)
+- **Support commenting entire directories or paths** [`6e12dd0d`]: `--path FILE|DIR --note TEXT`
+  writes a single annotation for the whole file or directory; an empty note is rejected
+  (the earlier version wrote one empty annotation per file: `03fb2d0f`, `4ef8b1af`, `a879f431`)
+- **Hash scope** [`41ee6bdc`, `6e12dd0d`]: `--hash-scope` removed; file and line annotations
+  always hash the whole file, directories hash a manifest of their files (see Design decisions)
 - **Built-in file selection/navigation** [`b3ef44ab`]: Implemented file browser mode in TUI with
   `j/k` navigation, `Enter` to select, `h/Left` to go to parent
 
