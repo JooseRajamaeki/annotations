@@ -84,8 +84,8 @@ fn print_help() {
     eprintln!("annotator — annotate code files with review-style comments");
     eprintln!();
     eprintln!("usage:");
-    eprintln!("  annotator                              interactive file browser");
-    eprintln!("  annotator <file>                       interactive TUI");
+    eprintln!("  annotator                              interactive TUI, starting in the file browser");
+    eprintln!("  annotator <file>                       interactive TUI, starting in <file> (b to browse, ? for keys)");
     eprintln!("  annotator <file> --lines A-B --note TEXT   save an annotation without the TUI");
     eprintln!("  annotator --path <path> --note TEXT        annotate a whole file or directory");
     eprintln!();
@@ -121,8 +121,8 @@ fn main() -> ExitCode {
         }
     }
 
-    // Handle file mode
-    if let Some(file) = cli.file {
+    // File mode: batch save with --lines/--note, otherwise open it in the TUI
+    let app = if let Some(file) = cli.file {
         let contents = match std::fs::read_to_string(&file) {
             Ok(c) => c,
             Err(e) => {
@@ -150,40 +150,18 @@ fn main() -> ExitCode {
             }
         }
 
-        match app::run(&file, &contents, &cli.output_dir) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
-            }
-        }
+        app::App::new(&file, &contents, &cli.output_dir)
     } else {
-        // No file or path specified - launch file browser
-        // Use current directory as starting point
+        // No file given: start in the file browser at the current directory.
         let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        match app::run_browser(&current_dir, &cli.output_dir) {
-            Ok(Some(selected_file)) => {
-                // File selected from browser - load it
-                let contents = match std::fs::read_to_string(&selected_file) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("error: cannot read {}: {e}", selected_file.display());
-                        return ExitCode::from(1);
-                    }
-                };
-                match app::run(&selected_file, &contents, &cli.output_dir) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        ExitCode::from(1)
-                    }
-                }
-            }
-            Ok(None) => ExitCode::SUCCESS, // User quit without selecting
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
-            }
+        app::App::new_browser(&current_dir, &cli.output_dir)
+    };
+
+    match app::run(app) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
     }
 }

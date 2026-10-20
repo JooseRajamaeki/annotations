@@ -20,17 +20,27 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 
 - **UI**: Terminal UI (TUI) built with `ratatui` + `crossterm`. "Painting" lines
   maps naturally to a vim-like visual selection in the terminal.
-- **Interaction model** (modal, vim-inspired):
-  - `j`/`k` or arrows: move cursor
-  - `v`: enter visual (paint) mode, move to extend the selection (`v`/`Esc` again to stop)
-  - `Enter` / `c`: write a note for the current selection
-  - Note editor: type text, `Esc` to save, `Ctrl+Q` to discard, `Enter` for newline;
-    text word-wraps and the box grows up to half the screen, then scrolls
-  - `q`: quit
-  - No file argument: start in a file browser (`j/k`, `Enter`/`l` open, `h` parent)
-- **Scopes**: an annotation is about a line range (TUI or `<file> --lines A-B`),
-  a whole file (`--path FILE`) or a whole directory (`--path DIR`). A
-  directory gets one annotation, not one per file.
+- **Interaction model** (modal, vim-inspired), one TUI session for everything.
+  The second header line always shows the main keys for the current mode
+  (kept within 80 columns); `?` opens a help screen listing every key.
+  - File view: `j`/`k` or arrows move, `g`/`G` top/bottom, `v` paint (select)
+    lines, `c`/`Enter` comment the line(s), `f` comment the whole file,
+    `b` open the file browser (in the open file's directory), `q` quit
+  - Painting: move to extend, `c`/`Enter` comment the selection, `v`/`Esc` stop
+  - File browser: `j`/`k` `g`/`G` move, `Enter` open file or directory,
+    `l`/`→` enter directory, `h`/`←`/`Backspace` parent, `c` comment the
+    selected file or directory, `C` comment the current directory, `Esc` back
+    to the open file, `q` quit
+  - Note editor: title says what is being commented on; `Esc` save, `Ctrl+Q`
+    discard (back to where you were), `Enter` newline, `←`/`→` move; text
+    word-wraps and the box grows up to half the screen, then scrolls
+  - `annotator` starts in the browser at the working directory,
+    `annotator <file>` starts in the file view
+- **Scopes**: an annotation is about a line range (TUI painting or
+  `<file> --lines A-B`), a whole file (TUI `f` / browser `c`, or `--path FILE`)
+  or a whole directory (browser `c`/`C`, or `--path DIR`). A directory gets one
+  annotation, not one per file. Paths inside the working directory are stored
+  relative to it.
 - **Storage**: one Markdown file per annotation, named `<UUID>.md`, written to
   an `annotations/` directory in the current working directory (configurable via `--output-dir`).
 - **Metadata**: collected at save time:
@@ -90,9 +100,11 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 - `src/annotation.rs` — hashing, Markdown output, git detection, file and
   directory annotations, `.gitignore`-aware directory hash.
 - `src/app.rs` — syntax highlighting, comment wrapping (`wrap_note`), key
-  handling (painting, saving, `Ctrl+Q` discard, empty comments, file browser)
-  and rendering into ratatui's `TestBackend` (comment box wrap/grow/scroll and
-  cursor placement, header hints).
+  handling for every action (painting, line/file/directory comments, discard,
+  empty comments, browser navigation and switching files, help screen) and
+  rendering into ratatui's `TestBackend` (comment box wrap/grow/scroll and
+  cursor placement, key hints per mode and their 80-column limit, help screen
+  lists every key).
 - `tests/cli.rs` — runs the built binary in temp dirs and git repos: all
   metadata fields, dirty-tree detection, line-range clamping, `--path` for
   files and directories, and every argument/runtime error path.
@@ -119,6 +131,11 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   the TUI cleared the painted selection before reading it (multi-line selections were saved as
   the cursor line only), and running with no arguments printed usage instead of opening the
   file browser
+- 2026-10-20 — Made every action reachable from the TUI (user feedback: "I could not see how to
+  navigate the directories and select another file"): single TUI session with `b` to browse
+  from a file and `Esc` back, file/directory comments from the TUI (`f`, browser `c`/`C`),
+  per-mode key hints on their own header line, `?` help screen. Fixed: quitting after opening
+  a file from the browser reopened that file in a second session
 
 ## Feedback from User Testing
 
@@ -146,6 +163,10 @@ Issues and feature requests collected from annotation files in `annotations/`
   always hash the whole file, directories hash a manifest of their files (see Design decisions)
 - **Built-in file selection/navigation** [`b3ef44ab`]: Implemented file browser mode in TUI with
   `j/k` navigation, `Enter` to select, `h/Left` to go to parent
+- **All actions available in the UI** (user feedback, not an annotation): the browser was only
+  reachable by starting without a file and its keys were not shown. Now `b` opens it from any
+  file, `Esc` returns, whole-file and directory comments work from the TUI, each mode shows its
+  keys and `?` lists them all
 
 ### Test artifacts (no action)
 - [`53c8ebe2`, `bf5e6bb4`]: "test batch mode" — batch-mode smoke tests
