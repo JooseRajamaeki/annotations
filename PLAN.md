@@ -143,7 +143,16 @@ Issues and feature requests collected from annotation files in `annotations/`
 (source annotation ID prefix in brackets).
 
 ### Open issues
-- None.
+- **Default output directory** [`e089cf26`]: the default (`annotations/` relative to where
+  the tool is run) is not really visible. Requested: `<repository root>/annotations/` when inside
+  a git repository; otherwise the working directory the tool was started from. To clarify:
+  whether outside a repo that means the working directory itself or `<cwd>/annotations/`.
+  (Related: the header shows `saves to: annotations`, a relative path, not the resolved
+  location.)
+- **Copy the painted lines into the annotation** [`998108af`]: add a `Context` section with the
+  commented lines, so an annotation shows the code it is about without opening the file.
+- **Mouse support** [`38f00d92`]: scroll the file with the mouse wheel, and paint lines by
+  dragging with the left button held down.
 
 ### UX Improvements (Addressed)
 - **Visual mode key** [`2792dba9`]: lowercase `v` starts/stops painting (`V` still works)
@@ -163,6 +172,8 @@ Issues and feature requests collected from annotation files in `annotations/`
   always hash the whole file, directories hash a manifest of their files (see Design decisions)
 - **Built-in file selection/navigation** [`b3ef44ab`]: Implemented file browser mode in TUI with
   `j/k` navigation, `Enter` to select, `h/Left` to go to parent
+- **Comment whole files from the TUI** [`8b628f99`]: `f` in the file view (the annotation
+  suggested `w`), or `c` on a file in the browser
 - **All actions available in the UI** (user feedback, not an annotation): the browser was only
   reachable by starting without a file and its keys were not shown. Now `b` opens it from any
   file, `Esc` returns, whole-file and directory comments work from the TUI, each mode shows its
@@ -171,3 +182,4 @@ Issues and feature requests collected from annotation files in `annotations/`
 ### Test artifacts (no action)
 - [`53c8ebe2`, `bf5e6bb4`]: "test batch mode" — batch-mode smoke tests
 - [`03fb2d0f`, `4ef8b1af`, `a879f431`]: empty comments from a `--path` test run
+- [`8965fffe`]: "Testing commenting the file" — confirms `f` saves a `scope: file` annotation
