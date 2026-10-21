@@ -1,12 +1,8 @@
 # annotator
 
-A minimal annotation tool for code. Open a file in the terminal, select some
-lines, write a note about them, and annotator saves it as a small Markdown
-file. That's all it does.
+Joose's minimal annotation tool for code. Open a file in the terminal, select some lines, write a note about them, and annotator saves it as a small Markdown file. That's all it does.
 
-There is no server, database, account or config file. Each annotation is a plain
-`<UUID>.md` file in an `annotations/` directory, which you can read, grep,
-commit or pass on to someone else (or to another tool).
+There is no server, database, account or config file. Each annotation is a plain `<UUID>.md` file in an `annotations/` directory, which you can read, grep, commit or pass on to someone else (or to another tool).
 
 ## Install
 
@@ -25,11 +21,9 @@ annotator                 # browse files, starting in the current directory
 annotator src/main.rs     # open a file
 ```
 
-In a file, select lines and press `c` to comment on them. Press `Esc` to save
-the comment, or `Ctrl+Q` to discard it.
+In a file, select lines and press `c` to comment on them. Press `Esc` to save the comment, or `Ctrl+Q` to discard it.
 
-The second line of the header always shows the main keys for what you are
-doing, and `?` lists them all.
+The second line of the header always shows the main keys for what you are doing, and `?` lists them all.
 
 | Key | Action |
 |---|---|
@@ -40,10 +34,7 @@ doing, and `?` lists them all.
 | `b` | browse files; `c` there comments on a file or directory |
 | `q` | quit |
 
-The mouse works too. Scroll with the wheel, click to move to a line, and drag
-to select lines. In the file browser, click to select an entry and click it again to
-open it. Because annotator captures the mouse, selecting text in the terminal
-needs your terminal's modifier key (usually Shift, or Option in iTerm2).
+The mouse works too. Scroll with the wheel, click to move to a line, and drag to select lines. In the file browser, click to select an entry and click it again to open it. Because annotator captures the mouse, selecting text in the terminal needs your terminal's modifier key (usually Shift, or Option in iTerm2).
 
 ### Without the interface
 
