@@ -45,18 +45,62 @@ fn line_range(contents: &str, start: usize, end: usize) -> String {
     lines.join("\n")
 }
 
-/// A Markdown code block holding `code`, tagged with `path`'s extension as the
-/// language. The fence is longer than any run of backticks inside `code`.
-fn code_block(code: &str, path: &Path) -> String {
+/// Length of the longest run of backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
     let mut longest = 0;
     let mut run = 0;
-    for c in code.chars() {
+    for c in text.chars() {
         run = if c == '`' { run + 1 } else { 0 };
         longest = longest.max(run);
     }
-    let fence = "`".repeat(longest.max(2) + 1);
+    longest
+}
+
+/// A Markdown code block holding `code`, tagged with `path`'s extension as the
+/// language. The fence is longer than any run of backticks inside `code`.
+fn code_block(code: &str, path: &Path) -> String {
+    let fence = "`".repeat(longest_backtick_run(code).max(2) + 1);
     let lang = path.extension().map_or(String::new(), |e| e.to_string_lossy().to_string());
     format!("{fence}{lang}\n{code}\n{fence}\n")
+}
+
+/// `text` as Markdown inline code. The fence is longer than any run of
+/// backticks inside `text`, and padded with spaces when `text` starts or ends
+/// with a backtick, so a backtick in a file name cannot end the code span.
+fn inline_code(text: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(text) + 1);
+    if text.starts_with('`') || text.ends_with('`') {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
+    }
+}
+
+/// Refuse paths with control characters: a newline in a file name would
+/// otherwise end the scope line and let the name forge the metadata below it.
+fn check_path(path: &Path) -> std::io::Result<()> {
+    if path.to_string_lossy().contains(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains control characters (such as a newline)",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse anything but a regular file (or a symlink to one). Opening a FIFO
+/// blocks forever and a device like /dev/zero never ends.
+fn check_regular_file(path: &Path) -> std::io::Result<()> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok(())
+}
+
+/// Contents of the text file at `path`, which must be a regular file.
+pub fn read_text_file(path: &Path) -> std::io::Result<String> {
+    check_regular_file(path)?;
+    fs::read_to_string(path)
 }
 
 /// Directory to run git in for `path`: the directory itself, or a file's parent.
@@ -134,12 +178,19 @@ fn walk(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
 /// Hash of a directory's contents: SHA-256 of a manifest with one
 /// `<file sha256>  <relative path>` line per file, sorted by path (the same
 /// format `sha256sum` prints). Files listed by git but missing on disk
-/// (deleted in the working tree) get `deleted` in place of a hash.
+/// (deleted in the working tree) get `deleted` in place of a hash. Anything
+/// that is not a regular file, such as a symlink to a FIFO or a device, is
+/// left out, since reading it could block or never end.
 pub fn directory_sha256(dir: &Path) -> String {
     let mut manifest = String::new();
     for rel in list_files(dir) {
-        let hash = match fs::read(dir.join(&rel)) {
-            Ok(bytes) => sha256_hex(&bytes),
+        let path = dir.join(&rel);
+        let hash = match fs::metadata(&path) {
+            Ok(meta) if !meta.is_file() => continue,
+            Ok(_) => match fs::read(&path) {
+                Ok(bytes) => sha256_hex(&bytes),
+                Err(_) => "deleted".to_string(),
+            },
             Err(_) => "deleted".to_string(),
         };
         manifest.push_str(&format!("{hash}  {}\n", rel.display()));
@@ -172,6 +223,7 @@ impl Annotation {
         let (scope, content_sha256) = if path.is_dir() {
             (Scope::Directory, directory_sha256(path))
         } else {
+            check_regular_file(path)?;
             (Scope::File, sha256_hex(&fs::read(path)?))
         };
         Ok(Annotation {
@@ -206,7 +258,7 @@ impl Annotation {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("# Annotation\n\n");
-        md.push_str(&format!("- scope: `{}`\n", self.scope_ref()));
+        md.push_str(&format!("- scope: {}\n", inline_code(&self.scope_ref())));
         match &self.git_commit {
             Some(commit) => md.push_str(&format!("- git_commit: `{commit}`\n")),
             None => md.push_str("- git_commit: unavailable\n"),
@@ -242,12 +294,14 @@ pub fn save_annotation(
     note: &str,
     output_dir: &Path,
 ) -> std::io::Result<PathBuf> {
+    check_path(file)?;
     Annotation::collect(file, contents, line_start, line_end, note).write(output_dir)
 }
 
 /// Build a single annotation for a whole file or directory and write it to
 /// `<output_dir>/<UUID>.md`. Returns the path of the written file.
 pub fn save_path_annotation(path: &Path, note: &str, output_dir: &Path) -> std::io::Result<PathBuf> {
+    check_path(path)?;
     Annotation::collect_for_path(path, note)?.write(output_dir)
 }
 
@@ -315,6 +369,25 @@ mod tests {
     fn code_block_fence_outlasts_backticks_in_code() {
         assert_eq!(code_block("a", Path::new("x.py")), "```py\na\n```\n");
         assert_eq!(code_block("```\nb", Path::new("Makefile")), "````\n```\nb\n````\n");
+    }
+
+    #[test]
+    fn inline_code_fence_outlasts_backticks_in_text() {
+        assert_eq!(inline_code("src/a.rs#L1"), "`src/a.rs#L1`");
+        assert_eq!(inline_code("a`b.rs"), "``a`b.rs``");
+        assert_eq!(inline_code("`a``.rs"), "``` `a``.rs ```");
+    }
+
+    #[test]
+    fn paths_with_control_characters_are_not_saved() {
+        let dir = std::env::temp_dir().join(format!("annotator-test-{}", Uuid::new_v4()));
+        let out = dir.join("out");
+        let forged = dir.join("x`\n- git_commit: `forged`\n.rs");
+        let err = save_annotation(&forged, "a\n", 1, 1, "n", &out).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = save_path_annotation(&forged, "n", &out).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!out.exists());
     }
 
     #[test]
