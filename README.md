@@ -9,6 +9,12 @@ There is no server, database, account or config file. Each annotation is a plain
 annotator is written in Rust and needs Rust 1.89 or newer.
 
 ```sh
+cargo install light-annotator
+```
+
+This installs the `annotator` command. To build from source instead:
+
+```sh
 git clone https://github.com/JooseRajamaeki/annotations.git
 cd annotations
 cargo install --path .

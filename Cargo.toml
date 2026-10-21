@@ -1,8 +1,21 @@
 [package]
-name = "annotator"
+name = "light-annotator"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
+description = "A minimal terminal tool for annotating code: select lines, write a note, get a Markdown file"
 license = "MIT"
+repository = "https://github.com/JooseRajamaeki/annotations"
+readme = "README.md"
+keywords = ["annotation", "code-review", "tui", "markdown", "notes"]
+categories = ["command-line-utilities", "development-tools"]
+# Notes written while developing annotator, and macOS folder metadata.
+exclude = ["annotations/", "**/.DS_Store"]
+
+# The command is `annotator`; the crate name differs because that one is taken.
+[[bin]]
+name = "annotator"
+path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4.45"
