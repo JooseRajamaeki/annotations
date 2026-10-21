@@ -160,9 +160,9 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   fenced code blocks, with Rust highlighting inside `rs`/`rust` blocks. Fixed: the Rust
   highlighter sliced lines by char index as if it were a byte index, so lines with non-ASCII
   text panicked (e.g. 32 lines of this file) or would show the wrong text
-- 2026-10-21 — Prepared publishing on crates.io as `light-annotator` (`annotator` is taken there);
-  the installed command stays `annotator`. Added package metadata, `rust-version = "1.89"` and
-  an `exclude` list for `annotations/` and `.DS_Store`
+- 2026-10-21 — Prepared publishing on crates.io as `annotations`, matching the repository name
+  (`annotator` is taken there); the installed command stays `annotator`. Added package metadata,
+  `rust-version = "1.89"` and an `exclude` list for `annotations/` and `.DS_Store`
 
 ## Feedback from User Testing
 
