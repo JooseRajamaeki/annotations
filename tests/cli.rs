@@ -280,3 +280,41 @@ fn runtime_errors_exit_with_one() {
     }
     assert!(!dir.path().join("annotations").exists());
 }
+
+#[test]
+fn file_names_cannot_forge_metadata() {
+    let dir = TempDir::new();
+    dir.write("a`b.rs", "x\n");
+    let md = annotate(dir.path(), &["a`b.rs", "--lines", "1-1", "--note", "x"]);
+    assert!(md.contains("- scope: ``a`b.rs#L1``\n"), "{md}");
+
+    let forged = "x`\n- git_commit: `forged`\n#.rs";
+    dir.write(forged, "x\n");
+    let out = annotator(dir.path(), &[forged, "--lines", "1-1", "--note", "x"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("control characters"), "{stderr}");
+    assert_eq!(fs::read_dir(dir.path().join("annotations")).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn fifos_are_refused_or_skipped_instead_of_blocking() {
+    let repo = TempDir::new();
+    repo.write("a.rs", "fn a() {}\n");
+    let made = Command::new("mkfifo").arg(repo.path().join("fifo")).status().unwrap();
+    assert!(made.success());
+    std::os::unix::fs::symlink("fifo", repo.path().join("link")).unwrap();
+    git(repo.path(), &["init", "-q"]);
+
+    for args in [&["fifo", "--lines", "1-1", "--note", "x"][..], &["--path", "link", "--note", "x"]] {
+        let out = annotator(repo.path(), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains("not a regular file"), "{args:?}: {stderr}");
+    }
+
+    let md = annotate(repo.path(), &["--path", ".", "--note", "x"]);
+    let manifest = format!("{}  a.rs\n", sha256_hex(b"fn a() {}\n"));
+    assert_eq!(field(&md, "content_sha256"), Some(sha256_hex(manifest.as_bytes()).as_str()));
+}

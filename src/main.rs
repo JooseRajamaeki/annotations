@@ -4,7 +4,7 @@ mod app;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use annotation::{save_annotation, save_path_annotation};
+use annotation::{read_text_file, save_annotation, save_path_annotation};
 
 struct Cli {
     file: Option<PathBuf>,
@@ -123,7 +123,7 @@ fn main() -> ExitCode {
 
     // File mode: batch save with --lines/--note, otherwise open it in the TUI
     let app = if let Some(file) = cli.file {
-        let contents = match std::fs::read_to_string(&file) {
+        let contents = match read_text_file(&file) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("error: cannot read {}: {e}", file.display());

@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use crate::annotation::{save_annotation, save_path_annotation};
+use crate::annotation::{read_text_file, save_annotation, save_path_annotation};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -672,7 +672,7 @@ impl App {
         if entry.is_dir {
             self.browse(entry.path, None);
         } else if open_files {
-            match fs::read_to_string(&entry.path) {
+            match read_text_file(&entry.path) {
                 Ok(contents) => {
                     self.load_file(&entry.path, contents);
                     self.status = "opened — v to paint lines, c to comment, b to browse".to_string();
