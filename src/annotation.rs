@@ -37,6 +37,8 @@ pub struct Annotation {
     /// For directories: SHA-256 of a `sha256sum`-style manifest of its files.
     pub content_sha256: String,
     pub created_at: String,
+    /// The annotated lines themselves, for line-range annotations.
+    pub context: Option<String>,
     pub note: String,
 }
 
@@ -44,6 +46,27 @@ pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Lines `start..=end` (1-based, inclusive) of `contents`.
+fn line_range(contents: &str, start: usize, end: usize) -> String {
+    let skip = start.saturating_sub(1);
+    let lines: Vec<&str> = contents.lines().skip(skip).take(end.saturating_sub(skip)).collect();
+    lines.join("\n")
+}
+
+/// A Markdown code block holding `code`, tagged with `path`'s extension as the
+/// language. The fence is longer than any run of backticks inside `code`.
+fn code_block(code: &str, path: &Path) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in code.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest.max(2) + 1);
+    let lang = path.extension().map_or(String::new(), |e| e.to_string_lossy().to_string());
+    format!("{fence}{lang}\n{code}\n{fence}\n")
 }
 
 /// Directory to run git in for `path`: the directory itself, or a file's parent.
@@ -149,6 +172,7 @@ impl Annotation {
             git_commit: git_commit(file),
             content_sha256: sha256_hex(contents.as_bytes()),
             created_at: Utc::now().to_rfc3339(),
+            context: Some(line_range(contents, line_start, line_end)),
             note: note.to_string(),
         }
     }
@@ -166,6 +190,7 @@ impl Annotation {
             git_commit: git_commit(path),
             content_sha256,
             created_at: Utc::now().to_rfc3339(),
+            context: None,
             note: note.to_string(),
         })
     }
@@ -192,6 +217,10 @@ impl Annotation {
         }
         md.push_str(&format!("- content_sha256: `{}`\n", self.content_sha256));
         md.push_str(&format!("- created_at: {}\n", self.created_at));
+        if let Some(context) = &self.context {
+            md.push_str("\n## Context\n\n");
+            md.push_str(&code_block(context, &self.path));
+        }
         md.push_str("\n## Comment\n\n");
         md.push_str(&self.note);
         md.push('\n');
@@ -246,6 +275,7 @@ mod tests {
             git_commit: Some("abc123".to_string()),
             content_sha256: "deadbeef".to_string(),
             created_at: "2026-10-19T00:00:00+00:00".to_string(),
+            context: Some("let x = 1;".to_string()),
             note: "this looks wrong".to_string(),
         };
         let md = a.to_markdown();
@@ -255,8 +285,23 @@ mod tests {
         assert!(md.contains("- git_commit: `abc123`"));
         assert!(md.contains("- content_sha256: `deadbeef`"));
         assert!(md.contains("- created_at: 2026-10-19T00:00:00+00:00"));
+        assert!(md.contains("## Context\n\n```rs\nlet x = 1;\n```\n\n## Comment"), "{md}");
         assert!(md.contains("## Comment"));
         assert!(md.contains("this looks wrong"));
+    }
+
+    #[test]
+    fn line_range_picks_the_annotated_lines() {
+        let contents = "one\ntwo\r\nthree\nfour\n";
+        assert_eq!(line_range(contents, 2, 3), "two\nthree");
+        assert_eq!(line_range(contents, 4, 4), "four");
+        assert_eq!(line_range("", 1, 1), "");
+    }
+
+    #[test]
+    fn code_block_fence_outlasts_backticks_in_code() {
+        assert_eq!(code_block("a", Path::new("x.py")), "```py\na\n```\n");
+        assert_eq!(code_block("```\nb", Path::new("Makefile")), "````\n```\nb\n````\n");
     }
 
     #[test]
@@ -267,6 +312,7 @@ mod tests {
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
+            context: None,
             note: "n".to_string(),
         };
         assert!(a.to_markdown().contains("- git_commit: unavailable"));
@@ -280,6 +326,7 @@ mod tests {
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
+            context: None,
             note: "n".to_string(),
         };
         let name = a.file_name();
@@ -305,6 +352,7 @@ mod tests {
         assert!(content.contains("- file: `"));
         assert!(content.contains("- lines: 1-1"));
         assert!(content.contains(&sha256_hex(b"fn main() {}\n")));
+        assert!(content.contains("## Context\n\n```rs\nfn main() {}\n```\n"));
         assert!(content.contains("looks good"));
 
         fs::remove_dir_all(&dir).unwrap();
@@ -360,6 +408,7 @@ mod tests {
         assert!(md.contains("- scope: file"));
         assert!(md.contains("- file: `"));
         assert!(!md.contains("- lines:"));
+        assert!(!md.contains("## Context"));
 
         fs::remove_dir_all(&dir).unwrap();
     }

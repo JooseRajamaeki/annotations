@@ -1,11 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
@@ -72,7 +75,16 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Enter", "new line"),
         ("← / →", "move the cursor"),
     ]),
+    ("Mouse", &[
+        ("wheel", "scroll"),
+        ("click", "move to a line / select an entry"),
+        ("drag", "paint lines"),
+        ("click again", "open the selected entry"),
+    ]),
 ];
+
+/// Lines (or browser entries) scrolled per mouse wheel step.
+const WHEEL_STEP: isize = 3;
 
 /// `path` relative to the working directory when it is inside it, so
 /// annotations record `src/main.rs` rather than an absolute path.
@@ -128,6 +140,10 @@ pub struct App {
     browser_entries: Vec<FileInfo>,
     browser_cursor: usize,
     browser_scroll: usize,
+    /// Where the file or browser list was last drawn, for mouse hit-testing.
+    body_area: Rect,
+    /// Line (0-based) the left mouse button was pressed on, while it is held.
+    drag_from: Option<usize>,
 }
 
 /// Colorize a line of Rust code with basic syntax highlighting
@@ -242,6 +258,17 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
     spans
 }
 
+/// Scroll a list of `len` items, `visible` of them on screen, by `delta` rows
+/// and pull `cursor` along so it stays on screen.
+fn scroll_view(scroll: &mut usize, cursor: &mut usize, len: usize, visible: usize, delta: isize) {
+    if visible == 0 {
+        return;
+    }
+    let max_scroll = len.saturating_sub(visible) as isize;
+    *scroll = (*scroll as isize + delta).clamp(0, max_scroll) as usize;
+    *cursor = (*cursor).clamp(*scroll, *scroll + visible - 1).min(len.saturating_sub(1));
+}
+
 /// The comment text laid out in rows of at most `width` characters.
 struct WrappedNote {
     rows: Vec<String>,
@@ -322,6 +349,8 @@ impl App {
             browser_entries: Vec::new(),
             browser_cursor: 0,
             browser_scroll: 0,
+            body_area: Rect::default(),
+            drag_from: None,
         }
     }
 
@@ -610,6 +639,86 @@ impl App {
         }
     }
 
+    /// List index under screen row `row` when the body is scrolled by `scroll`.
+    /// Negative or past the end when the row is outside the list.
+    fn index_at_row(&self, row: u16, scroll: usize) -> isize {
+        scroll as isize + row as isize - self.body_area.y as isize
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.show_help {
+            // Any click closes the help screen, like any key.
+            if let MouseEventKind::Down(_) = mouse.kind {
+                self.show_help = false;
+            }
+            return;
+        }
+        let visible = self.body_area.height as usize;
+        let in_body = self.body_area.contains(Position::new(mouse.column, mouse.row));
+        match self.mode {
+            Mode::Normal | Mode::Visual => match mouse.kind {
+                MouseEventKind::ScrollDown => {
+                    scroll_view(&mut self.scroll, &mut self.cursor, self.lines.len(), visible, WHEEL_STEP)
+                }
+                MouseEventKind::ScrollUp => {
+                    scroll_view(&mut self.scroll, &mut self.cursor, self.lines.len(), visible, -WHEEL_STEP)
+                }
+                // A click moves to the line and stops painting; dragging from it paints.
+                MouseEventKind::Down(MouseButton::Left) if in_body => {
+                    let line = self.index_at_row(mouse.row, self.scroll);
+                    if line < self.lines.len() as isize {
+                        self.anchor = None;
+                        self.mode = Mode::Normal;
+                        self.cursor = line as usize;
+                        self.drag_from = Some(self.cursor);
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(from) = self.drag_from {
+                        // Dragging above or below the body moves past the edge,
+                        // and the view scrolls to follow.
+                        let max = self.lines.len().saturating_sub(1) as isize;
+                        self.cursor = self.index_at_row(mouse.row, self.scroll).clamp(0, max) as usize;
+                        self.anchor = Some(from);
+                        self.mode = Mode::Visual;
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => self.drag_from = None,
+                _ => {}
+            },
+            Mode::FileBrowser => match mouse.kind {
+                MouseEventKind::ScrollDown => scroll_view(
+                    &mut self.browser_scroll,
+                    &mut self.browser_cursor,
+                    self.browser_entries.len(),
+                    visible,
+                    WHEEL_STEP,
+                ),
+                MouseEventKind::ScrollUp => scroll_view(
+                    &mut self.browser_scroll,
+                    &mut self.browser_cursor,
+                    self.browser_entries.len(),
+                    visible,
+                    -WHEEL_STEP,
+                ),
+                // Click selects an entry; clicking the selected entry opens it.
+                MouseEventKind::Down(MouseButton::Left) if in_body => {
+                    let idx = self.index_at_row(mouse.row, self.browser_scroll);
+                    if (0..self.browser_entries.len() as isize).contains(&idx) {
+                        if idx as usize == self.browser_cursor {
+                            self.browser_open_selected(true);
+                        } else {
+                            self.browser_cursor = idx as usize;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            // The comment is about the painted lines, so they stay put while writing.
+            Mode::Editing => {}
+        }
+    }
+
     /// The most useful keys for the current mode, always shown under the title.
     /// Kept within 80 columns; `?` lists everything.
     fn key_hints(&self) -> String {
@@ -629,7 +738,7 @@ impl App {
 pub fn run(mut app: App) -> std::io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -641,13 +750,14 @@ pub fn run(mut app: App) -> std::io::Result<()> {
         }
         match event::read() {
             Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => app.handle_key(key),
+            Ok(Event::Mouse(mouse)) => app.handle_mouse(mouse),
             Ok(_) => {}
             Err(e) => break Err(e),
         }
     };
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     result
 }
@@ -693,6 +803,7 @@ fn render(frame: &mut Frame, app: &mut App) {
         Line::from(Span::styled(app.key_hints(), Style::default().fg(Color::Yellow))),
     ];
     frame.render_widget(Paragraph::new(header), header_area);
+    app.body_area = body_area;
 
     let position = if app.browsing() {
         render_browser(frame, app, body_area);
@@ -1384,5 +1495,150 @@ mod tests {
         assert_eq!(app.lines, vec!["fn a() {}"]);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Mouse: `draw` first so the app knows where the body is. ---
+
+    fn mouse(app: &mut App, kind: MouseEventKind, row: u16) {
+        app.handle_mouse(MouseEvent { kind, column: 8, row, modifiers: KeyModifiers::NONE });
+    }
+
+    fn numbered_lines(n: usize) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    #[test]
+    fn dragging_paints_lines_and_the_comment_saves_them_as_context() {
+        let dir = temp_dir();
+        let file = dir.join("a.rs");
+        let contents = numbered_lines(10);
+        fs::write(&file, &contents).unwrap();
+        let out = dir.join("out");
+        let mut app = App::new(&file, &contents, &out);
+        draw(&mut app, 80, 12); // body is rows 2..=10
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 3); // line 2
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 4);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 5); // line 4
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5);
+        assert!(app.mode == Mode::Visual);
+        assert_eq!(app.selection(), (2, 4));
+
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 8); // button released: no effect
+        assert_eq!(app.selection(), (2, 4));
+
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "dedupe");
+        press(&mut app, KeyCode::Esc);
+        let md = fs::read_to_string(&saved_files(&out)[0]).unwrap();
+        assert!(md.contains("- lines: 2-4"), "{md}");
+        assert!(md.contains("## Context\n\n```rs\nline 2\nline 3\nline 4\n```\n\n## Comment\n\ndedupe\n"), "{md}");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn click_moves_cursor_and_stops_painting() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(5), Path::new("out"));
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        draw(&mut app, 80, 12);
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5); // line 4
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 5);
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.anchor, None);
+        assert_eq!(app.cursor, 3);
+
+        // Below the last line, in the header and in the status bar: ignored.
+        for row in [8, 0, 11] {
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), row);
+            assert_eq!(app.cursor, 3, "row {row}");
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_the_file_and_keeps_the_cursor_on_screen() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(50), Path::new("out"));
+        draw(&mut app, 80, 12); // 9 body rows
+
+        mouse(&mut app, MouseEventKind::ScrollDown, 4);
+        assert_eq!((app.scroll, app.cursor), (3, 3), "cursor pulled onto the screen");
+        assert!(draw(&mut app, 80, 12).0[2].contains("  4 line 4"));
+
+        for _ in 0..30 {
+            mouse(&mut app, MouseEventKind::ScrollDown, 4);
+        }
+        assert_eq!(app.scroll, 41, "stops with the last line at the bottom");
+        assert_eq!(app.cursor, 41);
+        assert!(draw(&mut app, 80, 12).0[10].contains(" 50 line 50"));
+
+        mouse(&mut app, MouseEventKind::ScrollUp, 4);
+        assert_eq!((app.scroll, app.cursor), (38, 41), "cursor still visible: stays");
+        draw(&mut app, 80, 12);
+        assert_eq!(app.scroll, 38, "render keeps the wheel position");
+    }
+
+    #[test]
+    fn dragging_past_the_bottom_scrolls_while_painting() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(50), Path::new("out"));
+        draw(&mut app, 80, 12);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 2); // line 1
+        for _ in 0..3 {
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 11); // status bar
+            draw(&mut app, 80, 12);
+        }
+        assert_eq!(app.selection(), (1, 12));
+        assert_eq!(app.scroll, 3);
+    }
+
+    #[test]
+    fn wheel_while_painting_extends_the_selection() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(50), Path::new("out"));
+        draw(&mut app, 80, 12);
+        press(&mut app, KeyCode::Char('v'));
+        mouse(&mut app, MouseEventKind::ScrollDown, 4);
+        assert!(app.mode == Mode::Visual);
+        assert_eq!(app.selection(), (1, 4));
+    }
+
+    #[test]
+    fn browser_click_selects_then_opens_and_wheel_scrolls() {
+        let dir = temp_dir();
+        fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        let mut app = App::new_browser(&dir, Path::new("out"));
+        draw(&mut app, 80, 12);
+
+        mouse(&mut app, MouseEventKind::ScrollDown, 4); // fewer entries than rows
+        assert_eq!((app.browser_scroll, app.browser_cursor), (0, 0));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 6); // past the entries
+        assert_eq!(app.browser_cursor, 0);
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 3);
+        assert!(app.mode == Mode::FileBrowser);
+        assert_eq!(app.browser_entries[app.browser_cursor].name, "b.rs");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 3);
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(app.lines, vec!["fn b() {}"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mouse_is_ignored_while_editing_and_click_closes_help() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(50), Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        draw(&mut app, 80, 20);
+        mouse(&mut app, MouseEventKind::ScrollDown, 4);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5);
+        assert!(app.mode == Mode::Editing);
+        assert_eq!((app.scroll, app.cursor), (0, 0));
+
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('?'));
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5);
+        assert!(!app.show_help);
+        assert_eq!(app.cursor, 0, "the click that closes help is not acted on");
     }
 }

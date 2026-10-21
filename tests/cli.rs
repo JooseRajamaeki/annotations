@@ -116,6 +116,7 @@ fn line_annotation_records_all_metadata() {
     let created = field(&md, "created_at").unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(created).is_ok(), "{created}");
     assert_eq!(comment(&md), "rename these");
+    assert!(md.contains("## Context\n\n```rs\nfn b() {}\nfn c() {}\n```\n"), "{md}");
 }
 
 #[test]

@@ -34,6 +34,13 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - Note editor: title says what is being commented on; `Esc` save, `Ctrl+Q`
     discard (back to where you were), `Enter` newline, `←`/`→` move; text
     word-wraps and the box grows up to half the screen, then scrolls
+  - Mouse: the wheel scrolls the file or browser (the cursor is pulled along
+    to stay on screen, so while painting it extends the selection); in the
+    file view a click moves to a line and dragging with the left button paints
+    lines (dragging past the top/bottom edge scrolls); in the browser a click
+    selects an entry and clicking the selected entry opens it. Ignored while
+    writing a comment. Mouse capture means terminal text selection needs the
+    terminal's modifier (e.g. Shift, or Option in iTerm2)
   - `annotator` starts in the browser at the working directory,
     `annotator <file>` starts in the file view
 - **Scopes**: an annotation is about a line range (TUI painting or
@@ -68,6 +75,12 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - content_sha256: <hash>
   - created_at: <RFC3339 UTC>
 
+  ## Context                (only for scope: lines)
+
+  ```rs                     (language tag = file extension)
+  <the annotated lines>
+  ```
+
   ## Comment
 
   <note text>
@@ -97,10 +110,10 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 
 `cargo test` runs:
 
-- `src/annotation.rs` — hashing, Markdown output, git detection, file and
+- `src/annotation.rs` — hashing, Markdown output (incl. the `Context` code block), git detection, file and
   directory annotations, `.gitignore`-aware directory hash.
 - `src/app.rs` — syntax highlighting, comment wrapping (`wrap_note`), key
-  handling for every action (painting, line/file/directory comments, discard,
+  handling for every action (painting, mouse wheel/click/drag, line/file/directory comments, discard,
   empty comments, browser navigation and switching files, help screen) and
   rendering into ratatui's `TestBackend` (comment box wrap/grow/scroll and
   cursor placement, key hints per mode and their 80-column limit, help screen
@@ -136,6 +149,10 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   from a file and `Esc` back, file/directory comments from the TUI (`f`, browser `c`/`C`),
   per-mode key hints on their own header line, `?` help screen. Fixed: quitting after opening
   a file from the browser reopened that file in a second session
+- 2026-10-21 — Line annotations save the annotated lines in a `## Context` section. Mouse
+  support: wheel scrolling, click to move/select, drag to paint lines, click again to open a
+  browser entry; listed under "Mouse" in the `?` help. Checked end to end by driving the binary
+  in a pty with SGR mouse sequences
 
 ## Feedback from User Testing
 
@@ -149,10 +166,6 @@ Issues and feature requests collected from annotation files in `annotations/`
   whether outside a repo that means the working directory itself or `<cwd>/annotations/`.
   (Related: the header shows `saves to: annotations`, a relative path, not the resolved
   location.)
-- **Copy the painted lines into the annotation** [`998108af`]: add a `Context` section with the
-  commented lines, so an annotation shows the code it is about without opening the file.
-- **Mouse support** [`38f00d92`]: scroll the file with the mouse wheel, and paint lines by
-  dragging with the left button held down.
 
 ### UX Improvements (Addressed)
 - **Visual mode key** [`2792dba9`]: lowercase `v` starts/stops painting (`V` still works)
@@ -165,6 +178,11 @@ Issues and feature requests collected from annotation files in `annotations/`
 - **Syntax highlighting** [`9e367b20`]: Added basic Rust syntax coloring for keywords (fn, let, pub, etc.), strings, and comments (line and block)
 
 ### Feature Requests (Addressed)
+- **Copy the painted lines into the annotation** [`998108af`]: line annotations (TUI and
+  `--lines`) get a `## Context` section with the lines in a code block, before `## Comment`;
+  the fence is lengthened when the code itself contains backtick runs
+- **Mouse support** [`38f00d92`]: the wheel scrolls, click moves to a line, left-drag paints
+  lines; in the browser click selects and a second click opens
 - **Support commenting entire directories or paths** [`6e12dd0d`]: `--path FILE|DIR --note TEXT`
   writes a single annotation for the whole file or directory; an empty note is rejected
   (the earlier version wrote one empty annotation per file: `03fb2d0f`, `4ef8b1af`, `a879f431`)
