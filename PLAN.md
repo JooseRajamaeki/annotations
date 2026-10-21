@@ -67,7 +67,7 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - timestamp (UTC)
 - **Output format** (`<UUID>.md`):
 
-  ```markdown
+  ````markdown
   # Annotation
 
   - scope: `path/to/file.rs#L12-18`   (or: `path/to/file.rs`, `path/to/dir/`)
@@ -84,7 +84,7 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   ## Comment
 
   <note text>
-  ```
+  ````
 
 ## Dependencies
 
@@ -112,7 +112,7 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 
 - `src/annotation.rs` — hashing, Markdown output (incl. the `Context` code block), git detection, file and
   directory annotations, `.gitignore`-aware directory hash.
-- `src/app.rs` — syntax highlighting, comment wrapping (`wrap_note`), key
+- `src/app.rs` — syntax highlighting (Rust, Markdown and code fences, non-ASCII text), comment wrapping (`wrap_note`), key
   handling for every action (painting, mouse wheel/click/drag, line/file/directory comments, discard,
   empty comments, browser navigation and switching files, help screen) and
   rendering into ratatui's `TestBackend` (comment box wrap/grow/scroll and
@@ -155,6 +155,11 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   in a pty with SGR mouse sequences
 - 2026-10-21 — Unified the `scope`, `file`/`path` and `lines` fields into one `scope` reference
   (`src/`, `src/foo.rs`, `src/foo.rs#L3-7`)
+- 2026-10-21 — Markdown highlighting for `.md`/`.markdown` files (other files keep the Rust
+  highlighter): headings, rules, quote and list markers, inline code, links, bold, italic, and
+  fenced code blocks, with Rust highlighting inside `rs`/`rust` blocks. Fixed: the Rust
+  highlighter sliced lines by char index as if it were a byte index, so lines with non-ASCII
+  text panicked (e.g. 32 lines of this file) or would show the wrong text
 
 ## Feedback from User Testing
 

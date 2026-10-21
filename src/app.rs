@@ -119,6 +119,9 @@ pub struct App {
     file: Option<PathBuf>,
     contents: String,
     lines: Vec<String>,
+    syntax: Syntax,
+    /// Code block state of each line, for Markdown files (empty otherwise).
+    md_lines: Vec<MdLine>,
     output_dir: PathBuf,
     cursor: usize,
     /// Start of the painted selection (0-based). `None` = no painting active.
@@ -150,6 +153,8 @@ pub struct App {
 fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
     let mut spans = Vec::new();
     let chars: Vec<char> = line.chars().collect();
+    // Byte offset of each char (plus the end), for slicing `line` by char index.
+    let byte: Vec<usize> = line.char_indices().map(|(b, _)| b).chain([line.len()]).collect();
     let mut i = 0;
     let keywords: std::collections::HashSet<_> = [
         "fn", "let", "mut", "const", "static", "pub", "crate", "mod", "use", "extern",
@@ -167,13 +172,13 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '/' {
             // Push anything before the comment
             if i > current_span_start {
-                spans.push(Span::raw(&line[current_span_start..i]));
+                spans.push(Span::raw(&line[byte[current_span_start]..byte[i]]));
             }
             let comment_start = i;
             while i < chars.len() && chars[i] != '\n' {
                 i += 1;
             }
-            spans.push(Span::styled(&line[comment_start..i], Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(&line[byte[comment_start]..byte[i]], Style::default().fg(Color::DarkGray)));
             current_span_start = i;
             continue;
         }
@@ -182,7 +187,7 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
             // Push anything before the comment
             if i > current_span_start {
-                spans.push(Span::raw(&line[current_span_start..i]));
+                spans.push(Span::raw(&line[byte[current_span_start]..byte[i]]));
             }
             let comment_start = i;
             i += 2;
@@ -193,7 +198,7 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
                 }
                 i += 1;
             }
-            spans.push(Span::styled(&line[comment_start..i], Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(&line[byte[comment_start]..byte[i]], Style::default().fg(Color::DarkGray)));
             current_span_start = i;
             continue;
         }
@@ -202,7 +207,7 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
         if c == '"' || c == '\'' {
             // Push anything before the string
             if i > current_span_start {
-                spans.push(Span::raw(&line[current_span_start..i]));
+                spans.push(Span::raw(&line[byte[current_span_start]..byte[i]]));
             }
             let string_start = i;
             let delim = c;
@@ -218,7 +223,7 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
                 }
                 i += 1;
             }
-            spans.push(Span::styled(&line[string_start..i], Style::default().fg(Color::Green)));
+            spans.push(Span::styled(&line[byte[string_start]..byte[i]], Style::default().fg(Color::Green)));
             current_span_start = i;
             continue;
         }
@@ -229,11 +234,11 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
             while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
                 i += 1;
             }
-            let word = &line[word_start..i];
+            let word = &line[byte[word_start]..byte[i]];
             if keywords.contains(word) {
                 // Push anything before the keyword
                 if word_start > current_span_start {
-                    spans.push(Span::raw(&line[current_span_start..word_start]));
+                    spans.push(Span::raw(&line[byte[current_span_start]..byte[word_start]]));
                 }
                 spans.push(Span::styled(word, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
                 current_span_start = i;
@@ -247,8 +252,8 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
     }
 
     // Push any remaining text at the end
-    if current_span_start < line.len() {
-        spans.push(Span::raw(&line[current_span_start..]));
+    if current_span_start < chars.len() {
+        spans.push(Span::raw(&line[byte[current_span_start]..]));
     }
 
     if spans.is_empty() {
@@ -256,6 +261,221 @@ fn syntax_highlight(line: &str) -> Vec<Span<'_>> {
     }
 
     spans
+}
+
+/// How a file's lines are colored, chosen from its extension.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Syntax {
+    Rust,
+    Markdown,
+}
+
+impl Syntax {
+    fn for_path(path: &Path) -> Syntax {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
+            Syntax::Markdown
+        } else {
+            Syntax::Rust
+        }
+    }
+}
+
+/// Where a Markdown line sits relative to fenced code blocks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MdLine {
+    Text,
+    /// An opening or closing ``` / ~~~ fence.
+    Fence,
+    /// Inside a fenced code block; `rust` when the block is tagged rs/rust.
+    Code { rust: bool },
+}
+
+/// A code fence: up to 3 spaces, then 3 or more backticks or tildes.
+/// Returns the fence char, the fence length and the info string after it.
+fn code_fence(line: &str) -> Option<(char, usize, &str)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let c = rest.chars().next().filter(|&c| c == '`' || c == '~')?;
+    let len = rest.len() - rest.trim_start_matches(c).len();
+    let info = rest[len..].trim();
+    if len < 3 || (c == '`' && info.contains('`')) {
+        return None;
+    }
+    Some((c, len, info))
+}
+
+/// Classify every line of a Markdown file. A block is closed by a fence of the
+/// same char that is at least as long as the opening one and has no info string.
+fn markdown_lines(lines: &[String]) -> Vec<MdLine> {
+    let mut open: Option<(char, usize, bool)> = None;
+    lines
+        .iter()
+        .map(|line| match (open, code_fence(line)) {
+            (None, Some((c, len, info))) => {
+                let lang = info.split_whitespace().next().unwrap_or("");
+                open = Some((c, len, lang == "rs" || lang == "rust"));
+                MdLine::Fence
+            }
+            (Some((c, len, _)), Some((fc, flen, ""))) if fc == c && flen >= len => {
+                open = None;
+                MdLine::Fence
+            }
+            (Some((_, _, rust)), _) => MdLine::Code { rust },
+            (None, None) => MdLine::Text,
+        })
+        .collect()
+}
+
+/// Colorize a line of Markdown text (not inside a code block): headings, rules,
+/// quote and list markers, then inline code, links, bold and italic.
+fn markdown_highlight(line: &str) -> Vec<Span<'_>> {
+    let marker = Style::default().fg(Color::Magenta);
+    let dim = Style::default().fg(Color::DarkGray);
+    let trimmed = line.trim_start();
+    let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) && (trimmed.len() == hashes || trimmed[hashes..].starts_with(' ')) {
+        return vec![Span::styled(line, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))];
+    }
+    let compact: String = trimmed.chars().filter(|c| *c != ' ').collect();
+    if compact.len() >= 3 && ['-', '*', '_'].iter().any(|&c| compact.trim_start_matches(c).is_empty()) {
+        return vec![Span::styled(line, dim)];
+    }
+
+    let mut spans = Vec::new();
+    // Indentation, then any `>` quote markers, then a list marker.
+    let mut pos = line.len() - trimmed.len();
+    if pos > 0 {
+        spans.push(Span::raw(&line[..pos]));
+    }
+    while line[pos..].starts_with('>') {
+        let end = if line[pos + 1..].starts_with(' ') { pos + 2 } else { pos + 1 };
+        spans.push(Span::styled(&line[pos..end], dim));
+        pos = end;
+    }
+    let rest = &line[pos..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let list_marker = if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        Some(2)
+    } else if (1..=9).contains(&digits) && (rest[digits..].starts_with(". ") || rest[digits..].starts_with(") ")) {
+        Some(digits + 2)
+    } else {
+        None
+    };
+    if let Some(len) = list_marker {
+        spans.push(Span::styled(&line[pos..pos + len], marker));
+        pos += len;
+    }
+    markdown_inline(line, pos, &mut spans);
+    if spans.is_empty() {
+        spans.push(Span::raw(line));
+    }
+    spans
+}
+
+/// End (exclusive) of an emphasis run that `delim` opens at byte `start`, or
+/// `None` if it does not open one. Like CommonMark, the text must not start or
+/// end with a space, and `_` does not work inside words (`snake_case`).
+fn emphasis_end(line: &str, start: usize, delim: &str) -> Option<usize> {
+    let inner = start + delim.len();
+    let underscore = delim.starts_with('_');
+    let before = line[..start].chars().next_back();
+    if line[inner..].starts_with([' ', '\t']) || (underscore && before.is_some_and(char::is_alphanumeric)) {
+        return None;
+    }
+    // A single `*` or `_` must not close on half of a `**` or `__`.
+    let single = (delim.len() == 1).then(|| delim.chars().next().unwrap_or('*'));
+    let mut from = inner;
+    while let Some(i) = line[from..].find(delim) {
+        let close = from + i;
+        let after = line[close + delim.len()..].chars().next();
+        let doubled = single.is_some_and(|c| after == Some(c) || line[..close].ends_with(c));
+        if close > inner
+            && !doubled
+            && !line[..close].ends_with([' ', '\t'])
+            && !(underscore && after.is_some_and(char::is_alphanumeric))
+        {
+            return Some(close + delim.len());
+        }
+        from = close + 1;
+    }
+    None
+}
+
+/// Inline Markdown from byte `pos` of `line` to its end, appended to `spans`.
+fn markdown_inline<'a>(line: &'a str, mut pos: usize, spans: &mut Vec<Span<'a>>) {
+    let code = Style::default().fg(Color::Yellow);
+    let link = Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+    let dim = Style::default().fg(Color::DarkGray);
+    let bytes = line.as_bytes();
+    // Start of the plain text not yet pushed.
+    let mut plain = pos;
+    while pos < line.len() {
+        // Every marker is ASCII, so `pos` is a char boundary whenever it matches.
+        let styled: Option<(usize, Vec<(usize, Style)>)> = match bytes[pos] {
+            b'\\' => {
+                pos += 2;
+                continue;
+            }
+            b'`' => {
+                let run = line[pos..].len() - line[pos..].trim_start_matches('`').len();
+                let fence = &line[pos..pos + run];
+                // Closing run of exactly the same length.
+                let mut close = None;
+                let mut from = pos + run;
+                while let Some(i) = line[from..].find(fence) {
+                    let at = from + i;
+                    let len = line[at..].len() - line[at..].trim_start_matches('`').len();
+                    if len == run {
+                        close = Some(at + run);
+                        break;
+                    }
+                    from = at + len;
+                }
+                match close {
+                    Some(end) => Some((end, vec![(end, code)])),
+                    None => {
+                        pos += run;
+                        continue;
+                    }
+                }
+            }
+            b'[' | b'!' if line[pos..].starts_with('[') || line[pos..].starts_with("![") => {
+                let text_start = pos + line[pos..].find('[').unwrap_or(0);
+                line[text_start..].find("](").and_then(|close| {
+                    let url_start = text_start + close + 1;
+                    let end = url_start + line[url_start..].find(')')? + 1;
+                    Some((end, vec![(url_start, link), (end, dim)]))
+                })
+            }
+            b'*' | b'_' => {
+                let delim = if bytes.get(pos + 1) == Some(&bytes[pos]) { &line[pos..pos + 2] } else { &line[pos..pos + 1] };
+                let modifier = if delim.len() == 2 { Modifier::BOLD } else { Modifier::ITALIC };
+                emphasis_end(line, pos, delim).map(|end| (end, vec![(end, Style::default().add_modifier(modifier))]))
+            }
+            _ => None,
+        };
+        match styled {
+            Some((end, parts)) => {
+                if plain < pos {
+                    spans.push(Span::raw(&line[plain..pos]));
+                }
+                let mut from = pos;
+                for (to, style) in parts {
+                    spans.push(Span::styled(&line[from..to], style));
+                    from = to;
+                }
+                pos = end;
+                plain = end;
+            }
+            None => pos += 1,
+        }
+    }
+    if plain < line.len() {
+        spans.push(Span::raw(&line[plain..]));
+    }
 }
 
 /// Scroll a list of `len` items, `visible` of them on screen, by `delta` rows
@@ -333,6 +553,8 @@ impl App {
             file: None,
             contents: String::new(),
             lines: vec![String::new()],
+            syntax: Syntax::Rust,
+            md_lines: Vec::new(),
             output_dir: output_dir.to_path_buf(),
             cursor: 0,
             anchor: None,
@@ -378,6 +600,11 @@ impl App {
         if self.lines.is_empty() {
             self.lines = vec![String::new()];
         }
+        self.syntax = Syntax::for_path(path);
+        self.md_lines = match self.syntax {
+            Syntax::Markdown => markdown_lines(&self.lines),
+            Syntax::Rust => Vec::new(),
+        };
         self.contents = contents;
         self.mode = Mode::Normal;
         self.cursor = 0;
@@ -478,6 +705,19 @@ impl App {
     fn move_cursor(&mut self, delta: isize) {
         let max = self.lines.len().saturating_sub(1) as isize;
         self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Line `idx` of the open file, colored for its syntax.
+    fn highlight(&self, idx: usize) -> Vec<Span<'_>> {
+        let line = &self.lines[idx];
+        match (self.syntax, self.md_lines.get(idx)) {
+            (Syntax::Markdown, Some(MdLine::Text)) => markdown_highlight(line),
+            (Syntax::Markdown, Some(MdLine::Fence)) => vec![Span::styled(line.as_str(), Style::default().fg(Color::DarkGray))],
+            (Syntax::Markdown, Some(MdLine::Code { rust: false })) => {
+                vec![Span::styled(line.as_str(), Style::default().fg(Color::Yellow))]
+            }
+            _ => syntax_highlight(line),
+        }
     }
 
     /// Whether the body shows the file browser (also while commenting on an entry from it).
@@ -918,7 +1158,7 @@ fn render_file(frame: &mut Frame, app: &mut App, body_area: Rect) {
         let marker = if selected { ">" } else { " " };
 
         // Apply syntax highlighting
-        let highlighted = syntax_highlight(&app.lines[idx]);
+        let highlighted = app.highlight(idx);
         let mut line_spans = vec![Span::styled(format!("{marker}{lineno:>gutter$} "), Style::default().fg(Color::DarkGray))];
 
         // Apply selection/cursor style to highlighted spans
@@ -1025,6 +1265,125 @@ mod tests {
         // Should have at least one keyword
         let has_keyword = spans.iter().any(|s| s.content == "fn");
         assert!(has_keyword, "Should find fn keyword");
+    }
+
+    /// Lines with non-ASCII text before and around every kind of token.
+    const NON_ASCII: &[&str] = &[
+        "- 16:55 — Started: explored in env",
+        "\"ä\" // x → y",
+        "ä fn x /* ö */ let",
+        "| `j`/`k`, `↑`/`↓` | move |",
+        "# Pää — otsikko",
+        "> lainaus **lihava ä** ja *kursiivi ö* [linkki ä](https://e.fi/ä) `koodi ä`",
+        "\\*ä* *ä",
+    ];
+
+    #[test]
+    fn highlighters_keep_text_intact_with_non_ascii() {
+        // The Rust highlighter used to slice by char index and panic here.
+        for line in NON_ASCII {
+            let rust: String = syntax_highlight(line).iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(&rust, line);
+            let md: String = markdown_highlight(line).iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(&md, line);
+        }
+    }
+
+    /// The style of the span whose text is exactly `text`.
+    fn style_of(spans: &[Span], text: &str) -> Style {
+        spans
+            .iter()
+            .find(|s| s.content == text)
+            .unwrap_or_else(|| panic!("no span {text:?} in {spans:?}"))
+            .style
+    }
+
+    #[test]
+    fn markdown_headings_rules_quotes_and_lists() {
+        let heading = markdown_highlight("## Usage");
+        assert_eq!(heading.len(), 1);
+        assert_eq!(heading[0].style.fg, Some(Color::Cyan));
+        assert!(heading[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(markdown_highlight("#hashtag")[0].style.fg, None, "needs a space after #");
+        assert_eq!(markdown_highlight("---")[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(markdown_highlight("* * *")[0].style.fg, Some(Color::DarkGray));
+
+        let item = markdown_highlight("  - item");
+        assert_eq!(style_of(&item, "- ").fg, Some(Color::Magenta));
+        let numbered = markdown_highlight("12. item");
+        assert_eq!(style_of(&numbered, "12. ").fg, Some(Color::Magenta));
+        let quote = markdown_highlight("> > - quoted item");
+        assert_eq!(style_of(&quote, "> ").fg, Some(Color::DarkGray));
+        assert_eq!(style_of(&quote, "- ").fg, Some(Color::Magenta));
+        assert_eq!(markdown_highlight("-not a list")[0].style.fg, None);
+    }
+
+    #[test]
+    fn markdown_inline_code_links_and_emphasis() {
+        let spans = markdown_highlight("use `a*b*c` or ``x ` y`` and **bold** and *it* or _it_");
+        assert_eq!(style_of(&spans, "`a*b*c`").fg, Some(Color::Yellow), "no emphasis inside code");
+        assert_eq!(style_of(&spans, "``x ` y``").fg, Some(Color::Yellow));
+        assert!(style_of(&spans, "**bold**").add_modifier.contains(Modifier::BOLD));
+        assert!(style_of(&spans, "*it*").add_modifier.contains(Modifier::ITALIC));
+        assert!(style_of(&spans, "_it_").add_modifier.contains(Modifier::ITALIC));
+
+        let link = markdown_highlight("see [the docs](https://x.y) and ![logo](a.png)");
+        assert_eq!(style_of(&link, "[the docs]").fg, Some(Color::Blue));
+        assert_eq!(style_of(&link, "(https://x.y)").fg, Some(Color::DarkGray));
+        assert_eq!(style_of(&link, "![logo]").fg, Some(Color::Blue));
+
+        // Not emphasis: snake_case, spaced-out stars, escapes, unclosed markers.
+        for line in ["call snake_case_name here", "2 * 3 * 4", "\\*not italic\\*", "*open", "`open", "[a](b"] {
+            let spans = markdown_highlight(line);
+            assert!(spans.iter().all(|s| s.style == Style::default()), "{line}: {spans:?}");
+        }
+        let nested = markdown_highlight("*a **b** c*");
+        assert!(style_of(&nested, "*a **b** c*").add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn markdown_code_fences() {
+        let lines: Vec<String> = [
+            "````markdown", "```rs", "fn a() {}", "```", "````", // a 3-tick fence inside a 4-tick block
+            "~~~ rust", "let x = 1;", "```", "~~~",              // ``` does not close ~~~
+            "```", "# not a heading", "``` trailing", "```",     // a closing fence has no info string
+            "text", "    ```", "text",                           // indented 4: not a fence
+        ]
+        .map(String::from)
+        .to_vec();
+        use MdLine::*;
+        let rust = Code { rust: true };
+        let other = Code { rust: false };
+        assert_eq!(
+            markdown_lines(&lines),
+            [
+                Fence, other, other, other, Fence,
+                Fence, rust, rust, Fence,
+                Fence, other, other, Fence,
+                Text, Text, Text,
+            ]
+        );
+        assert_eq!(markdown_lines(&["```".to_string(), "unclosed".to_string()]), [Fence, other]);
+    }
+
+    #[test]
+    fn markdown_files_are_drawn_with_markdown_colors() {
+        let text = "# Title\nfn is a word here\n```rs\nfn main() {}\n```\n";
+        let mut app = App::new(Path::new("notes.MD"), text, Path::new("out"));
+        app.cursor = 4; // keep the cursor's bold off the lines under test
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // The body starts on row 2, after a 5-column gutter (marker + 3 digits + space).
+        let fg = |row: u16, col: u16| buffer[(5 + col, 2 + row)].fg;
+        assert_eq!(fg(0, 2), Color::Cyan, "heading");
+        assert_eq!(fg(1, 0), Color::Reset, "`fn` in Markdown text is not a keyword");
+        assert_eq!(fg(2, 0), Color::DarkGray, "fence");
+        assert_eq!(fg(3, 0), Color::Cyan, "`fn` in a Rust code block is a keyword");
+
+        let rust = App::new(Path::new("main.rs"), text, Path::new("out"));
+        assert_eq!(rust.syntax, Syntax::Rust);
+        assert!(rust.md_lines.is_empty());
     }
 
     fn chars(s: &str) -> Vec<char> {
