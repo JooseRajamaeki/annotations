@@ -1147,8 +1147,7 @@ mod tests {
         let files = saved_files(&out);
         assert_eq!(files.len(), 1);
         let md = fs::read_to_string(&files[0]).unwrap();
-        assert!(md.contains("- scope: lines"));
-        assert!(md.contains("- lines: 2-3"));
+        assert!(md.contains("a.rs#L2-3`\n"), "{md}");
         assert!(md.ends_with("## Comment\n\nlooks off\n"), "{md}");
 
         fs::remove_dir_all(&dir).unwrap();
@@ -1380,7 +1379,7 @@ mod tests {
         let files = saved_files(&out);
         assert_eq!(files.len(), 1);
         let md = fs::read_to_string(&files[0]).unwrap();
-        assert!(md.contains("- scope: directory"), "{md}");
+        assert!(md.contains("src/`\n"), "{md}");
         assert!(md.contains("split this module"));
 
         fs::remove_dir_all(&dir).unwrap();
@@ -1408,7 +1407,7 @@ mod tests {
             .map(|f| fs::read_to_string(f).unwrap().lines().nth(2).unwrap().to_string())
             .collect();
         scopes.sort();
-        assert_eq!(scopes, ["- scope: directory", "- scope: file"]);
+        assert_eq!(scopes, [format!("- scope: `{}/`", dir.display()), format!("- scope: `{}`", dir.join("a.rs").display())]);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1428,8 +1427,7 @@ mod tests {
 
         assert!(app.mode == Mode::Normal);
         let md = fs::read_to_string(&saved_files(&out)[0]).unwrap();
-        assert!(md.contains("- scope: file"));
-        assert!(!md.contains("- lines:"));
+        assert!(md.contains(&format!("- scope: `{}`\n", file.display())), "{md}");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1531,7 +1529,7 @@ mod tests {
         type_text(&mut app, "dedupe");
         press(&mut app, KeyCode::Esc);
         let md = fs::read_to_string(&saved_files(&out)[0]).unwrap();
-        assert!(md.contains("- lines: 2-4"), "{md}");
+        assert!(md.contains("a.rs#L2-4`\n"), "{md}");
         assert!(md.contains("## Context\n\n```rs\nline 2\nline 3\nline 4\n```\n\n## Comment\n\ndedupe\n"), "{md}");
 
         fs::remove_dir_all(&dir).unwrap();

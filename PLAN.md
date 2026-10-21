@@ -60,22 +60,22 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
     Inside a repo the file list is tracked + untracked-but-not-ignored files
     (so `target/` is skipped, deleted files are listed as `deleted`); outside a
     repo it is a recursive walk that skips hidden entries
-  - file/directory path (as given)
-  - selected line range (start, end, 1-based), for line annotations only
+  - scope: the path plus, for line annotations, the line range, as one
+    code-link style reference — `src/` (directory, trailing slash),
+    `src/foo.rs` (file), `src/foo.rs#L3-7` (lines, 1-based inclusive; a single
+    line is `#L3`)
   - timestamp (UTC)
 - **Output format** (`<UUID>.md`):
 
   ```markdown
   # Annotation
 
-  - scope: lines            (or: file, directory)
-  - file: path/to/file.rs   (directories: - path: path/to/dir)
-  - lines: 12-18            (only for scope: lines)
+  - scope: `path/to/file.rs#L12-18`   (or: `path/to/file.rs`, `path/to/dir/`)
   - git_commit: <hash or "unavailable">
   - content_sha256: <hash>
   - created_at: <RFC3339 UTC>
 
-  ## Context                (only for scope: lines)
+  ## Context                (only for line ranges)
 
   ```rs                     (language tag = file extension)
   <the annotated lines>
@@ -153,6 +153,8 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   support: wheel scrolling, click to move/select, drag to paint lines, click again to open a
   browser entry; listed under "Mouse" in the `?` help. Checked end to end by driving the binary
   in a pty with SGR mouse sequences
+- 2026-10-21 — Unified the `scope`, `file`/`path` and `lines` fields into one `scope` reference
+  (`src/`, `src/foo.rs`, `src/foo.rs#L3-7`)
 
 ## Feedback from User Testing
 
@@ -178,6 +180,9 @@ Issues and feature requests collected from annotation files in `annotations/`
 - **Syntax highlighting** [`9e367b20`]: Added basic Rust syntax coloring for keywords (fn, let, pub, etc.), strings, and comments (line and block)
 
 ### Feature Requests (Addressed)
+- **One unified scope** [`64bca40a`]: `scope`, `file`/`path` and `lines` were redundant; now a
+  single `- scope:` field holds `src/`, `src/foo.rs` or `src/foo.rs#L3-7` (GitLab-style range,
+  as suggested; a single line is `#L3`). Older annotation files keep the previous fields
 - **Copy the painted lines into the annotation** [`998108af`]: line annotations (TUI and
   `--lines`) get a `## Context` section with the lines in a code block, before `## Comment`;
   the fence is lengthened when the code itself contains backtick runs

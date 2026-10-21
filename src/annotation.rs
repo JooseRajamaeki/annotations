@@ -17,16 +17,6 @@ pub enum Scope {
     Directory,
 }
 
-impl Scope {
-    fn label(self) -> &'static str {
-        match self {
-            Scope::Lines(..) => "lines",
-            Scope::File => "file",
-            Scope::Directory => "directory",
-        }
-    }
-}
-
 /// A single annotation: a comment tied to a line range, file or directory,
 /// plus the metadata collected at save time.
 pub struct Annotation {
@@ -200,17 +190,23 @@ impl Annotation {
         format!("{}.md", Uuid::new_v4())
     }
 
+    /// Path and scope as one reference, in the usual code-link style:
+    /// `src/` for a directory, `src/foo.rs` for a file, and `src/foo.rs#L3-7`
+    /// (or `#L3` for a single line) for a line range.
+    pub fn scope_ref(&self) -> String {
+        let path = self.path.display().to_string();
+        match self.scope {
+            Scope::Lines(start, end) if start == end => format!("{path}#L{start}"),
+            Scope::Lines(start, end) => format!("{path}#L{start}-{end}"),
+            Scope::File => path,
+            Scope::Directory => format!("{}/", path.trim_end_matches('/')),
+        }
+    }
+
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
         md.push_str("# Annotation\n\n");
-        md.push_str(&format!("- scope: {}\n", self.scope.label()));
-        match self.scope {
-            Scope::Directory => md.push_str(&format!("- path: `{}`\n", self.path.display())),
-            _ => md.push_str(&format!("- file: `{}`\n", self.path.display())),
-        }
-        if let Scope::Lines(start, end) = self.scope {
-            md.push_str(&format!("- lines: {start}-{end}\n"));
-        }
+        md.push_str(&format!("- scope: `{}`\n", self.scope_ref()));
         match &self.git_commit {
             Some(commit) => md.push_str(&format!("- git_commit: `{commit}`\n")),
             None => md.push_str("- git_commit: unavailable\n"),
@@ -279,15 +275,32 @@ mod tests {
             note: "this looks wrong".to_string(),
         };
         let md = a.to_markdown();
-        assert!(md.contains("- scope: lines"));
-        assert!(md.contains("- file: `src/foo.rs`"));
-        assert!(md.contains("- lines: 3-7"));
+        assert!(md.starts_with("# Annotation\n\n- scope: `src/foo.rs#L3-7`\n- git_commit"), "{md}");
         assert!(md.contains("- git_commit: `abc123`"));
         assert!(md.contains("- content_sha256: `deadbeef`"));
         assert!(md.contains("- created_at: 2026-10-19T00:00:00+00:00"));
         assert!(md.contains("## Context\n\n```rs\nlet x = 1;\n```\n\n## Comment"), "{md}");
         assert!(md.contains("## Comment"));
         assert!(md.contains("this looks wrong"));
+    }
+
+    #[test]
+    fn scope_ref_names_path_and_lines_in_one_reference() {
+        let at = |path: &str, scope| Annotation {
+            path: PathBuf::from(path),
+            scope,
+            git_commit: None,
+            content_sha256: "x".to_string(),
+            created_at: "t".to_string(),
+            context: None,
+            note: "n".to_string(),
+        };
+        assert_eq!(at("src/foo.rs", Scope::Lines(3, 7)).scope_ref(), "src/foo.rs#L3-7");
+        assert_eq!(at("src/foo.rs", Scope::Lines(3, 3)).scope_ref(), "src/foo.rs#L3");
+        assert_eq!(at("src/foo.rs", Scope::File).scope_ref(), "src/foo.rs");
+        assert_eq!(at("src", Scope::Directory).scope_ref(), "src/");
+        assert_eq!(at("src/", Scope::Directory).scope_ref(), "src/");
+        assert_eq!(at(".", Scope::Directory).scope_ref(), "./");
     }
 
     #[test]
@@ -349,8 +362,7 @@ mod tests {
         assert!(Uuid::parse_str(name.strip_suffix(".md").unwrap()).is_ok());
 
         let content = fs::read_to_string(&path).unwrap();
-        assert!(content.contains("- file: `"));
-        assert!(content.contains("- lines: 1-1"));
+        assert!(content.contains(&format!("- scope: `{}#L1`\n", file.display())), "{content}");
         assert!(content.contains(&sha256_hex(b"fn main() {}\n")));
         assert!(content.contains("## Context\n\n```rs\nfn main() {}\n```\n"));
         assert!(content.contains("looks good"));
@@ -405,9 +417,7 @@ mod tests {
         assert_eq!(a.scope, Scope::File);
         assert_eq!(a.content_sha256, sha256_hex(b"fn a() {}\nfn b() {}\n"));
         let md = a.to_markdown();
-        assert!(md.contains("- scope: file"));
-        assert!(md.contains("- file: `"));
-        assert!(!md.contains("- lines:"));
+        assert!(md.contains(&format!("- scope: `{}`\n", file.display())), "{md}");
         assert!(!md.contains("## Context"));
 
         fs::remove_dir_all(&dir).unwrap();
@@ -430,9 +440,7 @@ mod tests {
         );
         assert_eq!(a.content_sha256, sha256_hex(manifest.as_bytes()));
         let md = a.to_markdown();
-        assert!(md.contains("- scope: directory"));
-        assert!(md.contains("- path: `"));
-        assert!(!md.contains("- lines:"));
+        assert!(md.contains(&format!("- scope: `{}/`\n", dir.display())), "{md}");
 
         fs::write(dir.join("sub/b.txt"), "changed\n").unwrap();
         assert_ne!(directory_sha256(&dir), a.content_sha256);

@@ -107,9 +107,11 @@ fn line_annotation_records_all_metadata() {
     let head = commit_all(repo.path());
 
     let md = annotate(repo.path(), &["src/lib.rs", "--lines", "2-3", "--note", "rename these"]);
-    assert_eq!(field(&md, "scope"), Some("lines"));
-    assert_eq!(field(&md, "file"), Some("src/lib.rs"));
-    assert_eq!(field(&md, "lines"), Some("2-3"));
+    assert_eq!(field(&md, "scope"), Some("src/lib.rs#L2-3"));
+    // Scope replaces the separate file/path/lines fields.
+    for old in ["file", "path", "lines"] {
+        assert_eq!(field(&md, old), None, "{md}");
+    }
     assert_eq!(field(&md, "git_commit"), Some(head.as_str()));
     // The hash covers the whole file, not just the selected lines.
     assert_eq!(field(&md, "content_sha256"), Some(sha256_hex(&fs::read(file).unwrap()).as_str()));
@@ -151,7 +153,7 @@ fn line_range_end_is_clamped_to_file_length() {
     let dir = TempDir::new();
     dir.write("a.rs", "1\n2\n3\n");
     let md = annotate(dir.path(), &["a.rs", "--lines", "2-99", "--note", "x"]);
-    assert_eq!(field(&md, "lines"), Some("2-3"));
+    assert_eq!(field(&md, "scope"), Some("a.rs#L2-3"));
 }
 
 #[test]
@@ -177,9 +179,7 @@ fn file_path_annotation_covers_whole_file() {
     let head = commit_all(repo.path());
 
     let md = annotate(repo.path(), &["--path", "a.rs", "--note", "whole file"]);
-    assert_eq!(field(&md, "scope"), Some("file"));
-    assert_eq!(field(&md, "file"), Some("a.rs"));
-    assert_eq!(field(&md, "lines"), None);
+    assert_eq!(field(&md, "scope"), Some("a.rs"));
     assert_eq!(field(&md, "git_commit"), Some(head.as_str()));
     assert_eq!(field(&md, "content_sha256"), Some(sha256_hex(&fs::read(file).unwrap()).as_str()));
     assert_eq!(comment(&md), "whole file");
@@ -198,9 +198,7 @@ fn directory_annotation_is_one_file_with_manifest_hash() {
 
     let md = annotate(repo.path(), &["--path", ".", "--note", "whole repo", "--output-dir", out_dir]);
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1, "one annotation, not one per file");
-    assert_eq!(field(&md, "scope"), Some("directory"));
-    assert_eq!(field(&md, "path"), Some("."));
-    assert_eq!(field(&md, "lines"), None);
+    assert_eq!(field(&md, "scope"), Some("./"));
     assert_eq!(field(&md, "git_commit"), Some(head.as_str()));
 
     // Same as `git ls-files -co --exclude-standard | sort | xargs sha256sum | sha256sum`.
