@@ -29,6 +29,8 @@ annotator src/main.rs     # open a file
 
 In a file, select lines and press `c` to comment on them. Press `Esc` to save the comment, or `Ctrl+Q` to discard it.
 
+The first time you save, annotator asks your name and writes it into every annotation from then on, until you quit. You can leave it blank; annotator then asks once more to make sure.
+
 The second line of the header always shows the main keys for what you are doing, and `?` lists them all.
 
 | Key | Action |
@@ -47,6 +49,7 @@ The mouse works too. Scroll with the wheel, click to move to a line, and drag to
 ```sh
 annotator src/main.rs --lines 12-18 --note "This could be a loop"
 annotator --path src/ --note "Split this module"
+annotator --path src/ --note "Split this module" --user "Joose"
 ```
 
 Annotations go to `./annotations/` by default; use `--output-dir DIR` to
@@ -61,6 +64,7 @@ change this.
 - git_commit: `071ab73ab157b8e8c7c8c0ad9b487a8a92b5ccda`
 - content_sha256: `72a19e6b24f4453ada78e7d1ed430d461ce35aa1668c75d529cebd39f8e8053b`
 - created_at: 2026-10-21T11:25:06.865264+00:00
+- user: Joose
 
 ## Context
 
@@ -80,6 +84,7 @@ This could be a loop
 - **content_sha256**: a hash of the whole file (or, for a directory, of all its
   files). It shows whether the code has changed since the note was written,
   including uncommitted changes.
+- **user**: who wrote the note, or `unavailable` if they left their name blank.
 - **Context**: a copy of the selected lines, so the note still makes sense
   after the code changes. Only line annotations have it.
 

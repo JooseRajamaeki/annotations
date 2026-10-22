@@ -12,6 +12,7 @@ struct Cli {
     output_dir: PathBuf,
     lines: Option<(usize, usize)>,
     note: Option<String>,
+    user: Option<String>,
 }
 
 fn parse_args() -> Result<Cli, String> {
@@ -21,6 +22,7 @@ fn parse_args() -> Result<Cli, String> {
     let mut output_dir = PathBuf::from("annotations");
     let mut lines: Option<(usize, usize)> = None;
     let mut note: Option<String> = None;
+    let mut user: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -38,6 +40,9 @@ fn parse_args() -> Result<Cli, String> {
             }
             "--note" => {
                 note = Some(args.next().ok_or("--note requires a value")?);
+            }
+            "--user" => {
+                user = Some(args.next().ok_or("--user requires a value")?);
             }
             "--output-dir" => {
                 output_dir = PathBuf::from(args.next().ok_or("--output-dir requires a value")?);
@@ -77,6 +82,8 @@ fn parse_args() -> Result<Cli, String> {
         output_dir,
         lines,
         note,
+        // A blank name is the same as no name.
+        user: user.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()),
     })
 }
 
@@ -92,6 +99,7 @@ fn print_help() {
     eprintln!("options:");
     eprintln!("  --lines A-B       line range to annotate (1-based, inclusive)");
     eprintln!("  --note TEXT       comment text (batch mode)");
+    eprintln!("  --user NAME       who wrote the comment (batch mode; the TUI asks)");
     eprintln!("  --path PATH       file or directory to annotate as a whole (one annotation)");
     eprintln!("  --output-dir DIR  where to write <UUID>.md files (default: ./annotations)");
 }
@@ -109,7 +117,7 @@ fn main() -> ExitCode {
     // Path mode: one annotation for a whole file or directory
     if let Some(path) = cli.path {
         let note = cli.note.as_deref().unwrap_or_default();
-        match save_path_annotation(&path, note.trim(), &cli.output_dir) {
+        match save_path_annotation(&path, note.trim(), cli.user.as_deref(), &cli.output_dir) {
             Ok(saved) => {
                 println!("saved annotation: {}", saved.display());
                 return ExitCode::SUCCESS;
@@ -138,7 +146,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
             let end = end.min(total_lines);
-            match save_annotation(&file, &contents, start, end, note.trim(), &cli.output_dir) {
+            match save_annotation(&file, &contents, start, end, note.trim(), cli.user.as_deref(), &cli.output_dir) {
                 Ok(path) => {
                     println!("saved annotation: {}", path.display());
                     return ExitCode::SUCCESS;
