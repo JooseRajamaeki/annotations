@@ -117,6 +117,7 @@ fn line_annotation_records_all_metadata() {
     assert_eq!(field(&md, "content_sha256"), Some(sha256_hex(&fs::read(file).unwrap()).as_str()));
     let created = field(&md, "created_at").unwrap();
     assert!(chrono::DateTime::parse_from_rfc3339(created).is_ok(), "{created}");
+    assert_eq!(field(&md, "user"), Some("unavailable"), "no --user given");
     assert_eq!(comment(&md), "rename these");
     assert!(md.contains("## Context\n\n```rs\nfn b() {}\nfn c() {}\n```\n"), "{md}");
 }
@@ -146,6 +147,18 @@ fn git_commit_unavailable_outside_repo() {
     }
     let md = annotate(dir.path(), &["a.rs", "--lines", "1-1", "--note", "x"]);
     assert_eq!(field(&md, "git_commit"), Some("unavailable"));
+}
+
+#[test]
+fn user_is_recorded_and_blank_means_unavailable() {
+    let dir = TempDir::new();
+    dir.write("a.rs", "x\n");
+    let md = annotate(dir.path(), &["a.rs", "--lines", "1-1", "--note", "x", "--user", " Joose "]);
+    assert_eq!(field(&md, "user"), Some("Joose"));
+    let md = annotate(dir.path(), &["--path", "a.rs", "--note", "x", "--user", "Joose"]);
+    assert_eq!(field(&md, "user"), Some("Joose"));
+    let md = annotate(dir.path(), &["--path", "a.rs", "--note", "x", "--user", "  "]);
+    assert_eq!(field(&md, "user"), Some("unavailable"));
 }
 
 #[test]
@@ -253,6 +266,7 @@ fn invalid_arguments_are_rejected_without_writing() {
         (&["a.rs", "--lines", "x-1", "--note", "x"], "invalid line number"),
         (&["a.rs", "--lines", "3", "--note", "x"], "expected --lines START-END"),
         (&["a.rs", "--bogus"], "unknown argument: --bogus"),
+        (&["a.rs", "--lines", "1-1", "--note", "x", "--user"], "--user requires a value"),
     ];
     for (args, expected) in cases {
         let out = annotator(dir.path(), args);
@@ -271,6 +285,7 @@ fn runtime_errors_exit_with_one() {
         (&["a.rs", "--lines", "5-6", "--note", "x"], "beyond file length"),
         (&["missing.rs", "--lines", "1-1", "--note", "x"], "cannot read missing.rs"),
         (&["--path", "missing", "--note", "x"], "error:"),
+        (&["--path", "a.rs", "--note", "x", "--user", "a\nb"], "user name contains control characters"),
     ];
     for (args, expected) in cases {
         let out = annotator(dir.path(), args);

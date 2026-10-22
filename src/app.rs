@@ -21,6 +21,10 @@ pub enum Mode {
     Normal,
     Visual,
     Editing,
+    /// Asking the user's name, at the first save.
+    Naming,
+    /// The name was left blank: asking whether to save without one.
+    ConfirmNoName,
     FileBrowser,
 }
 
@@ -30,6 +34,8 @@ impl Mode {
             Mode::Normal => "NORMAL",
             Mode::Visual => "VISUAL (painting)",
             Mode::Editing => "EDITING",
+            Mode::Naming => "YOUR NAME",
+            Mode::ConfirmNoName => "NO NAME?",
             Mode::FileBrowser => "FILE BROWSER",
         }
     }
@@ -74,6 +80,11 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+Q", "discard"),
         ("Enter", "new line"),
         ("← / →", "move the cursor"),
+    ]),
+    ("Your name (asked at the first save)", &[
+        ("Enter", "save with this name"),
+        ("Esc", "back to the comment"),
+        ("y / n", "confirm a blank name / type one"),
     ]),
     ("Mouse", &[
         ("wheel", "scroll"),
@@ -134,6 +145,12 @@ pub struct App {
     target: CommentTarget,
     /// Mode to go back to when the note is saved or discarded.
     return_mode: Mode,
+    /// Name saved with every annotation: `None` until asked at the first
+    /// save, then `Some("")` if the user chose to leave it blank.
+    user: Option<String>,
+    /// The name being typed at the first save.
+    name: Vec<char>,
+    name_cursor: usize,
     show_help: bool,
     scroll: usize,
     status: String,
@@ -489,6 +506,25 @@ fn scroll_view(scroll: &mut usize, cursor: &mut usize, len: usize, visible: usiz
     *cursor = (*cursor).clamp(*scroll, *scroll + visible - 1).min(len.saturating_sub(1));
 }
 
+/// Apply a typing key (a char, Backspace, ←/→) to `text` and its cursor.
+fn edit_text(text: &mut Vec<char>, cursor: &mut usize, code: KeyCode) {
+    match code {
+        KeyCode::Backspace => {
+            if *cursor > 0 {
+                *cursor -= 1;
+                text.remove(*cursor);
+            }
+        }
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(text.len()),
+        KeyCode::Char(c) => {
+            text.insert(*cursor, c);
+            *cursor += 1;
+        }
+        _ => {}
+    }
+}
+
 /// The comment text laid out in rows of at most `width` characters.
 struct WrappedNote {
     rows: Vec<String>,
@@ -563,6 +599,9 @@ impl App {
             note_cursor: 0,
             target: CommentTarget::Lines,
             return_mode: mode,
+            user: None,
+            name: Vec::new(),
+            name_cursor: 0,
             show_help: false,
             scroll: 0,
             status: "press ? for help".to_string(),
@@ -720,9 +759,14 @@ impl App {
         }
     }
 
+    /// Whether a comment is being written or saved (the editor or the name prompt).
+    fn writing(&self) -> bool {
+        matches!(self.mode, Mode::Editing | Mode::Naming | Mode::ConfirmNoName)
+    }
+
     /// Whether the body shows the file browser (also while commenting on an entry from it).
     fn browsing(&self) -> bool {
-        self.mode == Mode::FileBrowser || (self.mode == Mode::Editing && self.return_mode == Mode::FileBrowser)
+        self.mode == Mode::FileBrowser || (self.writing() && self.return_mode == Mode::FileBrowser)
     }
 
     fn start_editing(&mut self, target: CommentTarget) {
@@ -762,33 +806,52 @@ impl App {
 
     fn save(&mut self) {
         let note: String = self.note.iter().collect::<String>().trim().to_string();
-        // Read the painted range before clearing the anchor below.
-        let (start, end) = self.selection();
-        self.note.clear();
-        self.note_cursor = 0;
         if note.is_empty() {
+            self.note.clear();
+            self.note_cursor = 0;
             self.mode = self.return_mode;
             self.status = "empty comment — nothing saved".to_string();
             return;
         }
+        if self.user.is_none() {
+            // First save: ask who is writing. The comment waits for the answer.
+            self.mode = Mode::Naming;
+            return;
+        }
+        // Read the painted range before clearing the anchor below.
+        let (start, end) = self.selection();
+        self.note.clear();
+        self.note_cursor = 0;
+        let user = self.user.as_deref().filter(|u| !u.is_empty());
         let result = match &self.target {
             CommentTarget::Lines => {
                 self.anchor = None;
                 self.mode = Mode::Normal;
                 match &self.file {
-                    Some(file) => save_annotation(file, &self.contents, start, end, &note, &self.output_dir),
+                    Some(file) => save_annotation(file, &self.contents, start, end, &note, user, &self.output_dir),
                     None => Err(std::io::Error::other("no file loaded")),
                 }
             }
             CommentTarget::Path(path) => {
                 self.mode = self.return_mode;
-                save_path_annotation(&relative_to_cwd(path), &note, &self.output_dir)
+                save_path_annotation(&relative_to_cwd(path), &note, user, &self.output_dir)
             }
         };
         self.status = match result {
             Ok(path) => format!("saved: {}", path.display()),
             Err(e) => format!("save failed: {e}"),
         };
+    }
+
+    /// Enter on the name prompt: save with the typed name, or ask first if it is blank.
+    fn confirm_name(&mut self) {
+        let name = self.name.iter().collect::<String>().trim().to_string();
+        if name.is_empty() {
+            self.mode = Mode::ConfirmNoName;
+        } else {
+            self.user = Some(name);
+            self.save();
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -838,18 +901,20 @@ impl App {
                     self.note.insert(self.note_cursor, '\n');
                     self.note_cursor += 1;
                 }
-                KeyCode::Backspace => {
-                    if self.note_cursor > 0 {
-                        self.note_cursor -= 1;
-                        self.note.remove(self.note_cursor);
-                    }
+                code => edit_text(&mut self.note, &mut self.note_cursor, code),
+            },
+            Mode::Naming => match key.code {
+                KeyCode::Enter => self.confirm_name(),
+                // Back to the comment, which is kept.
+                KeyCode::Esc => self.mode = Mode::Editing,
+                code => edit_text(&mut self.name, &mut self.name_cursor, code),
+            },
+            Mode::ConfirmNoName => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.user = Some(String::new());
+                    self.save();
                 }
-                KeyCode::Left => self.note_cursor = self.note_cursor.saturating_sub(1),
-                KeyCode::Right => self.note_cursor = (self.note_cursor + 1).min(self.note.len()),
-                KeyCode::Char(c) => {
-                    self.note.insert(self.note_cursor, c);
-                    self.note_cursor += 1;
-                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Naming,
                 _ => {}
             },
             Mode::FileBrowser => match key.code {
@@ -955,7 +1020,7 @@ impl App {
                 _ => {}
             },
             // The comment is about the painted lines, so they stay put while writing.
-            Mode::Editing => {}
+            Mode::Editing | Mode::Naming | Mode::ConfirmNoName => {}
         }
     }
 
@@ -966,6 +1031,8 @@ impl App {
             Mode::Normal => "? help · v paint lines · c comment line(s) · f comment file · b browse · q quit".to_string(),
             Mode::Visual => "? help · j/k extend · c comment selection · v/Esc stop painting".to_string(),
             Mode::Editing => "Esc save · Ctrl+Q discard · Enter new line · ←/→ move cursor".to_string(),
+            Mode::Naming => "Enter save with this name (may be blank) · Esc back to the comment".to_string(),
+            Mode::ConfirmNoName => "y save without a name · n type a name".to_string(),
             Mode::FileBrowser => {
                 let back = if self.file.is_some() { " · Esc back" } else { "" };
                 format!("? help · Enter open · h up · c comment entry · C comment dir{back} · q quit")
@@ -1005,6 +1072,7 @@ pub fn run(mut app: App) -> std::io::Result<()> {
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let editing = app.mode == Mode::Editing;
+    let naming = matches!(app.mode, Mode::Naming | Mode::ConfirmNoName);
 
     // The comment box grows with its wrapped text, up to half the screen.
     let wrapped_note = editing.then(|| {
@@ -1017,6 +1085,8 @@ fn render(frame: &mut Frame, app: &mut App) {
     let mut constraints = vec![Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)];
     if editing {
         constraints.push(Constraint::Length(note_rows as u16 + 2));
+    } else if naming {
+        constraints.push(Constraint::Length(3));
     }
     let chunks = Layout::vertical(constraints).split(area);
     let (header_area, body_area, status_area) = (chunks[0], chunks[1], chunks[2]);
@@ -1078,6 +1148,9 @@ fn render(frame: &mut Frame, app: &mut App) {
         let cursor_x = input_area.x + 1 + cursor_col as u16;
         let cursor_y = input_area.y + 1 + (cursor_row - scroll) as u16;
         frame.set_cursor_position((cursor_x.min(input_area.right().saturating_sub(2)), cursor_y));
+    }
+    if naming {
+        render_name_prompt(frame, app, chunks[3]);
     }
 
     if app.show_help {
@@ -1179,6 +1252,23 @@ fn render_file(frame: &mut Frame, app: &mut App, body_area: Rect) {
         body_lines.push(Line::from(line_spans));
     }
     frame.render_widget(Paragraph::new(body_lines), body_area);
+}
+
+/// The one-line box asking the user's name at the first save, or whether
+/// to save without one.
+fn render_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
+    if app.mode == Mode::ConfirmNoName {
+        let question = Span::styled("y save without a name · n type a name", Style::default().fg(Color::Yellow));
+        frame.render_widget(Paragraph::new(Line::from(question)).block(Block::bordered().title("No name given")), area);
+        return;
+    }
+    // Scroll sideways so the cursor stays visible.
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let skip = (app.name_cursor + 1).saturating_sub(width);
+    let text: String = app.name.iter().skip(skip).take(width).collect();
+    let title = "Your name, saved with each annotation — Enter save · Esc back";
+    frame.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), area);
+    frame.set_cursor_position((area.x + 1 + (app.name_cursor - skip) as u16, area.y + 1));
 }
 
 /// Centered popup listing every key (`?`).
@@ -1491,6 +1581,7 @@ mod tests {
         fs::write(&file, "one\ntwo\nthree\n").unwrap();
         let out = dir.join("out");
         let mut app = App::new(&file, &fs::read_to_string(&file).unwrap(), &out);
+        app.user = Some("tester".to_string());
 
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('v'));
@@ -1628,7 +1719,7 @@ mod tests {
     #[test]
     fn key_hints_fit_in_80_columns() {
         let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
-        for mode in [Mode::Normal, Mode::Visual, Mode::Editing, Mode::FileBrowser] {
+        for mode in [Mode::Normal, Mode::Visual, Mode::Editing, Mode::Naming, Mode::ConfirmNoName, Mode::FileBrowser] {
             app.mode = mode;
             let width = app.key_hints().chars().count();
             assert!(width <= 80, "{mode:?} hints are {width} columns");
@@ -1639,7 +1730,7 @@ mod tests {
     fn help_screen_lists_all_keys_and_any_key_closes_it() {
         let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
         press(&mut app, KeyCode::Char('?'));
-        let (rows, _) = draw(&mut app, 80, 40);
+        let (rows, _) = draw(&mut app, 80, 50);
         let screen = rows.join("\n");
         for (section, keys) in HELP {
             assert!(screen.contains(section), "missing section {section}");
@@ -1651,7 +1742,116 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert!(!app.show_help);
         assert!(!app.should_quit);
-        assert!(!draw(&mut app, 80, 40).0.join("\n").contains("press any key to close"));
+        assert!(!draw(&mut app, 80, 50).0.join("\n").contains("press any key to close"));
+    }
+
+    #[test]
+    fn first_save_asks_for_the_name_once() {
+        let dir = temp_dir();
+        let file = dir.join("a.rs");
+        fs::write(&file, "a\nb\n").unwrap();
+        let out = dir.join("out");
+        let mut app = App::new(&file, "a\nb\n", &out);
+
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "first");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Naming);
+        assert!(saved_files(&out).is_empty(), "nothing saved before the name is given");
+        let (rows, cursor) = draw(&mut app, 100, 20);
+        assert!(rows[17].starts_with("┌Your name, saved with each annotation"), "{rows:#?}");
+        assert!(rows[1].starts_with("Enter save with this name"), "{}", rows[1]);
+        assert_eq!(cursor, (1, 18));
+
+        type_text(&mut app, "  Joose ");
+        assert_eq!(draw(&mut app, 100, 20).1, (9, 18));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.mode == Mode::Normal);
+        assert!(app.status.starts_with("saved: "), "status: {}", app.status);
+
+        // The second comment is saved straight away, with the same name.
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "second");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Normal);
+        let files = saved_files(&out);
+        assert_eq!(files.len(), 2);
+        for f in files {
+            let md = fs::read_to_string(f).unwrap();
+            assert!(md.contains("- user: Joose\n"), "{md}");
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn blank_name_is_saved_only_after_confirming() {
+        let dir = temp_dir();
+        let file = dir.join("a.rs");
+        fs::write(&file, "a\n").unwrap();
+        let out = dir.join("out");
+        let mut app = App::new(&file, "a\n", &out);
+
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "anonymous note");
+        press(&mut app, KeyCode::Esc);
+        type_text(&mut app, "  ");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.mode == Mode::ConfirmNoName);
+        assert!(draw(&mut app, 100, 20).0[18].contains("y save without a name · n type a name"));
+        press(&mut app, KeyCode::Char('x')); // only y and n answer
+        assert!(app.mode == Mode::ConfirmNoName);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.mode == Mode::Naming, "back to typing a name");
+        assert!(saved_files(&out).is_empty());
+
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.mode == Mode::Normal);
+        let md = fs::read_to_string(&saved_files(&out)[0]).unwrap();
+        assert!(md.contains("- user: unavailable\n"), "{md}");
+        assert!(md.ends_with("anonymous note\n"), "{md}");
+
+        // Not asked again.
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "again");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Normal);
+        assert_eq!(saved_files(&out).len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn esc_on_the_name_prompt_goes_back_to_the_comment() {
+        let dir = temp_dir();
+        fs::write(dir.join("a.rs"), "a\n").unwrap();
+        let out = dir.join("out");
+        let mut app = App::new_browser(&dir, &out);
+
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "keep me");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Naming);
+        assert!(draw(&mut app, 100, 20).0[2].contains("a.rs"), "browser stays visible");
+        type_text(&mut app, "Jo");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Editing);
+        assert_eq!(app.note.iter().collect::<String>(), "keep me");
+        assert_eq!(app.user, None);
+
+        type_text(&mut app, "!");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.name.iter().collect::<String>(), "Jo", "typed name is kept");
+        type_text(&mut app, "ose");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.mode == Mode::FileBrowser);
+        let md = fs::read_to_string(&saved_files(&out)[0]).unwrap();
+        assert!(md.contains("- user: Joose\n"), "{md}");
+        assert!(md.ends_with("keep me!\n"), "{md}");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1724,6 +1924,7 @@ mod tests {
         fs::write(dir.join("src/a.rs"), "a\n").unwrap();
         let out = dir.join("out");
         let mut app = App::new_browser(&dir, &out);
+        app.user = Some("tester".to_string());
 
         press(&mut app, KeyCode::Char('c')); // "src" is the first entry
         assert!(app.mode == Mode::Editing);
@@ -1750,6 +1951,7 @@ mod tests {
         fs::write(dir.join("a.rs"), "a\n").unwrap();
         let out = dir.join("out");
         let mut app = App::new_browser(&dir, &out);
+        app.user = Some("tester".to_string());
 
         press(&mut app, KeyCode::Char('C'));
         assert_eq!(app.target, CommentTarget::Path(dir.clone()));
@@ -1778,6 +1980,7 @@ mod tests {
         fs::write(&file, "a\nb\n").unwrap();
         let out = dir.join("out");
         let mut app = App::new(&file, "a\nb\n", &out);
+        app.user = Some("tester".to_string());
 
         press(&mut app, KeyCode::Char('f'));
         assert!(draw(&mut app, 100, 20).0.join("\n").contains("Comment on file "));
@@ -1872,6 +2075,7 @@ mod tests {
         fs::write(&file, &contents).unwrap();
         let out = dir.join("out");
         let mut app = App::new(&file, &contents, &out);
+        app.user = Some("tester".to_string());
         draw(&mut app, 80, 12); // body is rows 2..=10
 
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 3); // line 2

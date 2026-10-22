@@ -27,6 +27,8 @@ pub struct Annotation {
     /// For directories: SHA-256 of a `sha256sum`-style manifest of its files.
     pub content_sha256: String,
     pub created_at: String,
+    /// Who wrote the annotation; `None` when they left their name blank.
+    pub user: Option<String>,
     /// The annotated lines themselves, for line-range annotations.
     pub context: Option<String>,
     pub note: String,
@@ -83,6 +85,17 @@ fn check_path(path: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "path contains control characters (such as a newline)",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse user names with control characters, for the same reason as paths.
+fn check_user(user: Option<&str>) -> std::io::Result<()> {
+    if user.is_some_and(|u| u.contains(char::is_control)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "user name contains control characters (such as a newline)",
         ));
     }
     Ok(())
@@ -206,6 +219,7 @@ impl Annotation {
         line_start: usize,
         line_end: usize,
         note: &str,
+        user: Option<&str>,
     ) -> Annotation {
         Annotation {
             path: file.to_path_buf(),
@@ -213,13 +227,14 @@ impl Annotation {
             git_commit: git_commit(file),
             content_sha256: sha256_hex(contents.as_bytes()),
             created_at: Utc::now().to_rfc3339(),
+            user: user.map(str::to_string),
             context: Some(line_range(contents, line_start, line_end)),
             note: note.to_string(),
         }
     }
 
     /// Annotation for a whole file or a whole directory.
-    pub fn collect_for_path(path: &Path, note: &str) -> std::io::Result<Annotation> {
+    pub fn collect_for_path(path: &Path, note: &str, user: Option<&str>) -> std::io::Result<Annotation> {
         let (scope, content_sha256) = if path.is_dir() {
             (Scope::Directory, directory_sha256(path))
         } else {
@@ -232,6 +247,7 @@ impl Annotation {
             git_commit: git_commit(path),
             content_sha256,
             created_at: Utc::now().to_rfc3339(),
+            user: user.map(str::to_string),
             context: None,
             note: note.to_string(),
         })
@@ -265,6 +281,10 @@ impl Annotation {
         }
         md.push_str(&format!("- content_sha256: `{}`\n", self.content_sha256));
         md.push_str(&format!("- created_at: {}\n", self.created_at));
+        match &self.user {
+            Some(user) => md.push_str(&format!("- user: {user}\n")),
+            None => md.push_str("- user: unavailable\n"),
+        }
         if let Some(context) = &self.context {
             md.push_str("\n## Context\n\n");
             md.push_str(&code_block(context, &self.path));
@@ -292,17 +312,25 @@ pub fn save_annotation(
     line_start: usize,
     line_end: usize,
     note: &str,
+    user: Option<&str>,
     output_dir: &Path,
 ) -> std::io::Result<PathBuf> {
     check_path(file)?;
-    Annotation::collect(file, contents, line_start, line_end, note).write(output_dir)
+    check_user(user)?;
+    Annotation::collect(file, contents, line_start, line_end, note, user).write(output_dir)
 }
 
 /// Build a single annotation for a whole file or directory and write it to
 /// `<output_dir>/<UUID>.md`. Returns the path of the written file.
-pub fn save_path_annotation(path: &Path, note: &str, output_dir: &Path) -> std::io::Result<PathBuf> {
+pub fn save_path_annotation(
+    path: &Path,
+    note: &str,
+    user: Option<&str>,
+    output_dir: &Path,
+) -> std::io::Result<PathBuf> {
     check_path(path)?;
-    Annotation::collect_for_path(path, note)?.write(output_dir)
+    check_user(user)?;
+    Annotation::collect_for_path(path, note, user)?.write(output_dir)
 }
 
 #[cfg(test)]
@@ -325,6 +353,7 @@ mod tests {
             git_commit: Some("abc123".to_string()),
             content_sha256: "deadbeef".to_string(),
             created_at: "2026-10-19T00:00:00+00:00".to_string(),
+            user: Some("Joose".to_string()),
             context: Some("let x = 1;".to_string()),
             note: "this looks wrong".to_string(),
         };
@@ -332,7 +361,7 @@ mod tests {
         assert!(md.starts_with("# Annotation\n\n- scope: `src/foo.rs#L3-7`\n- git_commit"), "{md}");
         assert!(md.contains("- git_commit: `abc123`"));
         assert!(md.contains("- content_sha256: `deadbeef`"));
-        assert!(md.contains("- created_at: 2026-10-19T00:00:00+00:00"));
+        assert!(md.contains("- created_at: 2026-10-19T00:00:00+00:00\n- user: Joose\n"), "{md}");
         assert!(md.contains("## Context\n\n```rs\nlet x = 1;\n```\n\n## Comment"), "{md}");
         assert!(md.contains("## Comment"));
         assert!(md.contains("this looks wrong"));
@@ -346,6 +375,7 @@ mod tests {
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
+            user: None,
             context: None,
             note: "n".to_string(),
         };
@@ -383,11 +413,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("annotator-test-{}", Uuid::new_v4()));
         let out = dir.join("out");
         let forged = dir.join("x`\n- git_commit: `forged`\n.rs");
-        let err = save_annotation(&forged, "a\n", 1, 1, "n", &out).unwrap_err();
+        let err = save_annotation(&forged, "a\n", 1, 1, "n", None, &out).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        let err = save_path_annotation(&forged, "n", &out).unwrap_err();
+        let err = save_path_annotation(&forged, "n", None, &out).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn user_names_with_control_characters_are_not_saved() {
+        let dir = std::env::temp_dir().join(format!("annotator-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        fs::write(&file, "a\n").unwrap();
+        let out = dir.join("out");
+        let forged = Some("me\n- git_commit: `forged`");
+        let err = save_annotation(&file, "a\n", 1, 1, "n", forged, &out).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = save_path_annotation(&file, "n", forged, &out).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!out.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -398,10 +444,12 @@ mod tests {
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
+            user: None,
             context: None,
             note: "n".to_string(),
         };
         assert!(a.to_markdown().contains("- git_commit: unavailable"));
+        assert!(a.to_markdown().contains("- user: unavailable"));
     }
 
     #[test]
@@ -412,6 +460,7 @@ mod tests {
             git_commit: None,
             content_sha256: "x".to_string(),
             created_at: "t".to_string(),
+            user: None,
             context: None,
             note: "n".to_string(),
         };
@@ -429,7 +478,7 @@ mod tests {
         fs::write(&file, "fn main() {}\n").unwrap();
         let out = dir.join("out");
 
-        let path = save_annotation(&file, "fn main() {}\n", 1, 1, "looks good", &out).unwrap();
+        let path = save_annotation(&file, "fn main() {}\n", 1, 1, "looks good", Some("Joose"), &out).unwrap();
         assert!(path.exists());
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         assert!(Uuid::parse_str(name.strip_suffix(".md").unwrap()).is_ok());
@@ -438,6 +487,7 @@ mod tests {
         assert!(content.contains(&format!("- scope: `{}#L1`\n", file.display())), "{content}");
         assert!(content.contains(&sha256_hex(b"fn main() {}\n")));
         assert!(content.contains("## Context\n\n```rs\nfn main() {}\n```\n"));
+        assert!(content.contains("- user: Joose\n"), "{content}");
         assert!(content.contains("looks good"));
 
         fs::remove_dir_all(&dir).unwrap();
@@ -486,7 +536,7 @@ mod tests {
         let file = dir.join("a.rs");
         fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
 
-        let a = Annotation::collect_for_path(&file, "whole file").unwrap();
+        let a = Annotation::collect_for_path(&file, "whole file", None).unwrap();
         assert_eq!(a.scope, Scope::File);
         assert_eq!(a.content_sha256, sha256_hex(b"fn a() {}\nfn b() {}\n"));
         let md = a.to_markdown();
@@ -504,7 +554,7 @@ mod tests {
         fs::write(dir.join("sub/b.txt"), "b\n").unwrap();
         fs::write(dir.join(".hidden"), "ignored\n").unwrap();
 
-        let a = Annotation::collect_for_path(&dir, "whole dir").unwrap();
+        let a = Annotation::collect_for_path(&dir, "whole dir", None).unwrap();
         assert_eq!(a.scope, Scope::Directory);
         let manifest = format!(
             "{}  a.txt\n{}  sub/b.txt\n",
@@ -519,7 +569,7 @@ mod tests {
         assert_ne!(directory_sha256(&dir), a.content_sha256);
 
         let out = dir.join("out");
-        save_path_annotation(&dir, "whole dir", &out).unwrap();
+        save_path_annotation(&dir, "whole dir", None, &out).unwrap();
         assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
 
         fs::remove_dir_all(&dir).unwrap();

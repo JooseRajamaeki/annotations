@@ -34,6 +34,10 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - Note editor: title says what is being commented on; `Esc` save, `Ctrl+Q`
     discard (back to where you were), `Enter` newline, `←`/`→` move; text
     word-wraps and the box grows up to half the screen, then scrolls
+  - Name prompt: the first save of a session asks the user's name, used for
+    every annotation until quitting (no config file, so it is not remembered
+    between runs). `Enter` saves, `Esc` goes back to the comment. A blank name
+    asks "save without a name?": `y` saves, `n` goes back to typing one
   - Mouse: the wheel scrolls the file or browser (the cursor is pulled along
     to stay on screen, so while painting it extends the selection); in the
     file view a click moves to a line and dragging with the left button paints
@@ -65,6 +69,8 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
     `src/foo.rs` (file), `src/foo.rs#L3-7` (lines, 1-based inclusive; a single
     line is `#L3`)
   - timestamp (UTC)
+  - user name: asked in the TUI, `--user NAME` in batch mode; `unavailable`
+    when left blank
 - **Output format** (`<UUID>.md`):
 
   ````markdown
@@ -74,6 +80,7 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - git_commit: <hash or "unavailable">
   - content_sha256: <hash>
   - created_at: <RFC3339 UTC>
+  - user: <name or "unavailable">
 
   ## Context                (only for line ranges)
 
@@ -163,6 +170,9 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 - 2026-10-21 — Prepared publishing on crates.io as `annotations`, matching the repository name
   (`annotator` is taken there); the installed command stays `annotator`. Added package metadata,
   `rust-version = "1.89"` and an `exclude` list for `annotations/` and `.DS_Store`
+- 2026-10-22 — Annotations record a `user`. The TUI asks the name at the first save of a
+  session (a blank name needs a `y` to confirm); batch mode takes `--user NAME`. Names with
+  control characters are refused, like paths, so they cannot forge metadata lines
 
 ## Feedback from User Testing
 
