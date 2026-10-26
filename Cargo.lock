@@ -34,6 +34,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "sha2 0.11.1",
+ "unicode-width",
  "uuid",
 ]
 

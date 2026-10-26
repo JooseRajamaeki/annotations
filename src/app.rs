@@ -13,6 +13,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
+use unicode_width::UnicodeWidthChar;
 
 use crate::annotation::{read_text_file, save_annotation, save_path_annotation};
 
@@ -97,6 +98,14 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
 /// Lines (or browser entries) scrolled per mouse wheel step.
 const WHEEL_STEP: isize = 3;
 
+const SELECTED_BG: Color = Color::Rgb(45, 70, 110);
+/// The cursor line needs a background: bold alone is lost on lines that are
+/// already bold, such as Markdown headings.
+const CURSOR_BG: Color = Color::Rgb(50, 50, 58);
+
+/// Shown in place of the line number on the rows a long line wraps onto.
+const WRAP_MARK: &str = "↪";
+
 /// `path` relative to the working directory when it is inside it, so
 /// annotations record `src/main.rs` rather than an absolute path.
 fn relative_to_cwd(path: &Path) -> PathBuf {
@@ -162,6 +171,9 @@ pub struct App {
     browser_scroll: usize,
     /// Where the file or browser list was last drawn, for mouse hit-testing.
     body_area: Rect,
+    /// Line (0-based) drawn on each row of the body, as wrapped lines take
+    /// several rows.
+    row_lines: Vec<usize>,
     /// Line (0-based) the left mouse button was pressed on, while it is held.
     drag_from: Option<usize>,
 }
@@ -583,6 +595,74 @@ fn wrap_note(note: &[char], cursor: usize, width: usize) -> WrappedNote {
     WrappedNote { rows, cursor: cursor_pos }
 }
 
+/// Columns `c` takes on screen. ratatui does not draw control chars such as tabs.
+fn char_width(c: char) -> usize {
+    if c.is_control() { 0 } else { c.width().unwrap_or(0) }
+}
+
+/// Byte offsets where the screen rows of `line` start when it is wrapped to
+/// `width` columns; the first is always 0. Breaks after the last space in a
+/// row when there is one and mid-word otherwise, like `wrap_note`.
+fn wrap_starts(line: &str, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut starts = vec![0];
+    let mut used = 0;
+    // Just after the last space in the row, and the row width up to there.
+    let mut after_space: Option<(usize, usize)> = None;
+    // Whether the row has text before its spaces. Without this, an indented
+    // long word would leave a row holding only the indentation.
+    let mut has_text = false;
+    for (i, c) in line.char_indices() {
+        let w = char_width(c);
+        if used + w > width && used > 0 {
+            if c == ' ' {
+                // The space is the break itself: it hangs past the edge.
+                starts.push(i + c.len_utf8());
+                (used, after_space, has_text) = (0, None, false);
+                continue;
+            }
+            match after_space {
+                Some((start, at)) => {
+                    starts.push(start);
+                    (used, has_text) = (used - at, start < i);
+                }
+                None => {
+                    starts.push(i);
+                    (used, has_text) = (0, false);
+                }
+            }
+            after_space = None;
+        }
+        used += w;
+        if c == ' ' {
+            if has_text {
+                after_space = Some((i + 1, used));
+            }
+        } else {
+            has_text = true;
+        }
+    }
+    starts
+}
+
+/// Split the spans of one line into screen rows starting at the byte offsets `starts`.
+fn split_rows(spans: Vec<Span<'_>>, starts: &[usize]) -> Vec<Vec<Span<'static>>> {
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new(); starts.len()];
+    let mut offset = 0;
+    for span in spans {
+        let end = offset + span.content.len();
+        for (row, &start) in starts.iter().enumerate() {
+            let stop = starts.get(row + 1).copied().unwrap_or(usize::MAX);
+            let (from, to) = (start.max(offset), stop.min(end));
+            if from < to {
+                rows[row].push(Span::styled(span.content[from - offset..to - offset].to_string(), span.style));
+            }
+        }
+        offset = end;
+    }
+    rows
+}
+
 impl App {
     fn empty(output_dir: &Path, mode: Mode, browser_path: PathBuf) -> App {
         App {
@@ -611,6 +691,7 @@ impl App {
             browser_cursor: 0,
             browser_scroll: 0,
             body_area: Rect::default(),
+            row_lines: Vec::new(),
             drag_from: None,
         }
     }
@@ -744,6 +825,61 @@ impl App {
     fn move_cursor(&mut self, delta: isize) {
         let max = self.lines.len().saturating_sub(1) as isize;
         self.cursor = (self.cursor as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// Digits of the line number column, which has a marker before it and a space after.
+    fn gutter_digits(&self) -> usize {
+        self.lines.len().to_string().len().max(3)
+    }
+
+    /// Columns left for the text of a line, in the body as last drawn.
+    fn text_width(&self) -> usize {
+        (self.body_area.width as usize).saturating_sub(self.gutter_digits() + 2).max(1)
+    }
+
+    /// Screen rows line `idx` takes when wrapped.
+    fn line_rows(&self, idx: usize) -> usize {
+        wrap_starts(&self.lines[idx], self.text_width()).len()
+    }
+
+    /// The first line of a view that ends with line `last` and fits in
+    /// `visible` rows. It is `last` itself if that line alone is taller.
+    fn top_for(&self, last: usize, visible: usize) -> usize {
+        let mut top = last;
+        let mut rows = self.line_rows(last);
+        while top > 0 {
+            rows += self.line_rows(top - 1);
+            if rows > visible {
+                break;
+            }
+            top -= 1;
+        }
+        top
+    }
+
+    /// The last line drawn in full when the view starts at `self.scroll`.
+    fn last_full_line(&self, visible: usize) -> usize {
+        let mut last = self.scroll;
+        let mut rows = self.line_rows(last);
+        while last + 1 < self.lines.len() {
+            rows += self.line_rows(last + 1);
+            if rows > visible {
+                break;
+            }
+            last += 1;
+        }
+        last
+    }
+
+    /// Scroll the file by `delta` lines and pull the cursor along so it stays on screen.
+    fn scroll_file(&mut self, delta: isize) {
+        let visible = self.body_area.height as usize;
+        if visible == 0 {
+            return;
+        }
+        let max_scroll = self.top_for(self.lines.len() - 1, visible);
+        self.scroll = (self.scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
+        self.cursor = self.cursor.clamp(self.scroll, self.last_full_line(visible));
     }
 
     /// Line `idx` of the open file, colored for its syntax.
@@ -950,6 +1086,22 @@ impl App {
         scroll as isize + row as isize - self.body_area.y as isize
     }
 
+    /// File line under screen row `row`. Each row above the body or below the
+    /// drawn lines counts as one more line past that edge.
+    fn line_at_row(&self, row: u16) -> isize {
+        let offset = row as isize - self.body_area.y as isize;
+        if offset < 0 {
+            return self.scroll as isize + offset;
+        }
+        match self.row_lines.get(offset as usize) {
+            Some(&line) => line as isize,
+            None => {
+                let last = self.row_lines.last().map_or(self.scroll as isize - 1, |&l| l as isize);
+                last + 1 + offset - self.row_lines.len() as isize
+            }
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.show_help {
             // Any click closes the help screen, like any key.
@@ -962,15 +1114,11 @@ impl App {
         let in_body = self.body_area.contains(Position::new(mouse.column, mouse.row));
         match self.mode {
             Mode::Normal | Mode::Visual => match mouse.kind {
-                MouseEventKind::ScrollDown => {
-                    scroll_view(&mut self.scroll, &mut self.cursor, self.lines.len(), visible, WHEEL_STEP)
-                }
-                MouseEventKind::ScrollUp => {
-                    scroll_view(&mut self.scroll, &mut self.cursor, self.lines.len(), visible, -WHEEL_STEP)
-                }
+                MouseEventKind::ScrollDown => self.scroll_file(WHEEL_STEP),
+                MouseEventKind::ScrollUp => self.scroll_file(-WHEEL_STEP),
                 // A click moves to the line and stops painting; dragging from it paints.
                 MouseEventKind::Down(MouseButton::Left) if in_body => {
-                    let line = self.index_at_row(mouse.row, self.scroll);
+                    let line = self.line_at_row(mouse.row);
                     if line < self.lines.len() as isize {
                         self.anchor = None;
                         self.mode = Mode::Normal;
@@ -983,7 +1131,7 @@ impl App {
                         // Dragging above or below the body moves past the edge,
                         // and the view scrolls to follow.
                         let max = self.lines.len().saturating_sub(1) as isize;
-                        self.cursor = self.index_at_row(mouse.row, self.scroll).clamp(0, max) as usize;
+                        self.cursor = self.line_at_row(mouse.row).clamp(0, max) as usize;
                         self.anchor = Some(from);
                         self.mode = Mode::Visual;
                     }
@@ -1184,7 +1332,7 @@ fn render_browser(frame: &mut Frame, app: &mut App, body_area: Rect) {
         let is_selected = idx == app.browser_cursor;
         let mut style = Style::default();
         if is_selected {
-            style = style.bg(Color::Rgb(45, 70, 110)).fg(Color::White);
+            style = style.bg(SELECTED_BG).fg(Color::White);
         }
         if entry.is_dir {
             style = style.add_modifier(Modifier::BOLD);
@@ -1205,52 +1353,53 @@ fn render_file(frame: &mut Frame, app: &mut App, body_area: Rect) {
     if app.cursor < app.scroll {
         app.scroll = app.cursor;
     }
-    if visible > 0 && app.cursor >= app.scroll + visible {
-        app.scroll = app.cursor + 1 - visible;
+    if visible > 0 {
+        app.scroll = app.scroll.max(app.top_for(app.cursor, visible));
     }
 
     let (sel_start, sel_end) = app.selection();
+    let gutter = app.gutter_digits();
+    let width = app.text_width();
 
-    // Body: painted lines are highlighted.
-    let gutter = app.lines.len().to_string().len().max(3);
+    // Body: long lines wrap; painted lines and the cursor line are highlighted.
     let mut body_lines: Vec<Line> = Vec::new();
-    for row in 0..visible {
-        let idx = app.scroll + row;
-        if idx >= app.lines.len() {
-            break;
-        }
+    let mut row_lines = Vec::new();
+    let mut idx = app.scroll;
+    while body_lines.len() < visible && idx < app.lines.len() {
         let lineno = idx + 1;
         let selected = app.anchor.is_some() && lineno >= sel_start && lineno <= sel_end;
-        let mut style = Style::default();
-        if selected {
-            style = style.bg(Color::Rgb(45, 70, 110)).fg(Color::White);
-        }
-        if idx == app.cursor && !selected {
-            style = style.add_modifier(Modifier::BOLD);
-        }
+        let line_style = if selected {
+            Some(Style::default().bg(SELECTED_BG).fg(Color::White))
+        } else if idx == app.cursor {
+            Some(Style::default().bg(CURSOR_BG).add_modifier(Modifier::BOLD))
+        } else {
+            None
+        };
         let marker = if selected { ">" } else { " " };
 
-        // Apply syntax highlighting
-        let highlighted = app.highlight(idx);
-        let mut line_spans = vec![Span::styled(format!("{marker}{lineno:>gutter$} "), Style::default().fg(Color::DarkGray))];
-
-        // Apply selection/cursor style to highlighted spans
-        if selected {
-            for span in highlighted {
-                line_spans.push(Span::styled(span.content, style));
+        let rows = split_rows(app.highlight(idx), &wrap_starts(&app.lines[idx], width));
+        for (r, row) in rows.into_iter().enumerate().take(visible - body_lines.len()) {
+            let number = if r == 0 { lineno.to_string() } else { WRAP_MARK.to_string() };
+            let mut spans = vec![Span::styled(format!("{marker}{number:>gutter$} "), Style::default().fg(Color::DarkGray))];
+            match line_style {
+                Some(style) => {
+                    let used: usize = row.iter().map(Span::width).sum();
+                    // A selection replaces the syntax colors; the cursor keeps them.
+                    spans.extend(row.into_iter().map(|span| {
+                        let s = if selected { style } else { span.style.patch(style) };
+                        span.style(s)
+                    }));
+                    // Fill the row so a wrapped line reads as one block.
+                    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
+                }
+                None => spans.extend(row),
             }
-        } else if idx == app.cursor {
-            for span in highlighted {
-                line_spans.push(Span::styled(span.content, span.style.patch(style)));
-            }
-        } else {
-            for span in highlighted {
-                line_spans.push(span);
-            }
+            body_lines.push(Line::from(spans));
+            row_lines.push(idx);
         }
-
-        body_lines.push(Line::from(line_spans));
+        idx += 1;
     }
+    app.row_lines = row_lines;
     frame.render_widget(Paragraph::new(body_lines), body_area);
 }
 
@@ -1522,6 +1671,67 @@ mod tests {
             let no_spaces = |s: String| s.replace(' ', "");
             assert_eq!(no_spaces(w.rows.concat()), no_spaces(note.iter().collect()));
         }
+    }
+
+    /// The rows `line` wraps into at `width` columns.
+    fn wrapped(line: &str, width: usize) -> Vec<&str> {
+        let starts = wrap_starts(line, width);
+        let ends = starts.iter().skip(1).copied().chain([line.len()]);
+        starts.iter().zip(ends).map(|(&a, b)| &line[a..b]).collect()
+    }
+
+    #[test]
+    fn wrap_starts_breaks_at_spaces_then_mid_word() {
+        assert_eq!(wrapped("", 5), [""]);
+        assert_eq!(wrapped("short", 5), ["short"]);
+        assert_eq!(wrapped("hello world foo", 11), ["hello world ", "foo"], "the space at the edge hangs");
+        assert_eq!(wrapped("aa bbb cc", 5), ["aa ", "bbb ", "cc"]);
+        assert_eq!(wrapped("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrapped("    longword", 6), ["    lo", "ngword"], "no row of only indentation");
+        assert_eq!(wrapped("ääää öö", 4), ["ääää ", "öö"]);
+        assert_eq!(wrapped("漢字漢字", 5), ["漢字", "漢字"], "wide chars take two columns");
+        assert_eq!(wrapped("漢", 1), ["漢"], "a char wider than the row still gets one");
+    }
+
+    #[test]
+    fn split_rows_keeps_styles_across_breaks() {
+        let red = Style::default().fg(Color::Red);
+        let spans = vec![Span::raw("ab"), Span::styled("cdef", red), Span::raw("g")];
+        let rows = split_rows(spans, &[0, 3, 6]);
+        let text = |row: &[Span]| row.iter().map(|s| (s.content.to_string(), s.style)).collect::<Vec<_>>();
+        assert_eq!(text(&rows[0]), [("ab".to_string(), Style::default()), ("c".to_string(), red)]);
+        assert_eq!(text(&rows[1]), [("def".to_string(), red)]);
+        assert_eq!(text(&rows[2]), [("g".to_string(), Style::default())]);
+    }
+
+    #[test]
+    fn long_lines_wrap_and_keep_their_line_numbers() {
+        let text = "one two three four five six\nshort\n";
+        let mut app = App::new(Path::new("x.md"), text, Path::new("out"));
+        // 20 wide: a 5-column gutter leaves 15 for the text.
+        let (rows, _) = draw(&mut app, 20, 8);
+        assert_eq!(rows[2].trim_end(), "   1 one two three");
+        assert_eq!(rows[3].trim_end(), "   ↪ four five six");
+        assert_eq!(rows[4].trim_end(), "   2 short");
+        assert_eq!(app.row_lines, [0, 0, 1]);
+
+        // Painting marks every row of a wrapped line.
+        press(&mut app, KeyCode::Char('v'));
+        let (rows, _) = draw(&mut app, 20, 8);
+        assert!(rows[2].starts_with(">  1") && rows[3].starts_with(">  ↪"), "{rows:#?}");
+    }
+
+    #[test]
+    fn cursor_line_is_visible_on_markdown_headings() {
+        // The cursor used to be only bold, which a heading already is.
+        let mut app = App::new(Path::new("x.md"), "# Title\ntext\n", Path::new("out"));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 8)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(5, 2)].fg, Color::Cyan, "heading keeps its color");
+        assert_eq!(buffer[(5, 2)].bg, CURSOR_BG);
+        assert_eq!(buffer[(29, 2)].bg, CURSOR_BG, "the whole row is marked");
+        assert_eq!(buffer[(5, 3)].bg, Color::Reset);
     }
 
     #[test]
@@ -2161,6 +2371,36 @@ mod tests {
         mouse(&mut app, MouseEventKind::ScrollDown, 4);
         assert!(app.mode == Mode::Visual);
         assert_eq!(app.selection(), (1, 4));
+    }
+
+    #[test]
+    fn mouse_and_scrolling_count_wrapped_rows() {
+        // Every line is "long line N ..." and wraps onto 2 rows at 20 columns.
+        let text: String = (1..=10).map(|i| format!("long line {i} wraps here\n")).collect();
+        let mut app = App::new(Path::new("x.rs"), &text, Path::new("out"));
+        draw(&mut app, 20, 9); // body is rows 2..=7: 3 lines
+        assert_eq!(app.row_lines, [0, 0, 1, 1, 2, 2]);
+
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5); // second row of line 2
+        assert_eq!(app.cursor, 1);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), 8); // status bar: one past line 3
+        assert_eq!(app.selection(), (2, 4));
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), 8);
+        draw(&mut app, 20, 9);
+        assert_eq!(app.scroll, 1, "scrolled so line 4 fits");
+
+        press(&mut app, KeyCode::Esc);
+        for _ in 0..10 {
+            mouse(&mut app, MouseEventKind::ScrollDown, 4);
+        }
+        assert_eq!(app.scroll, 7, "stops with the last line at the bottom");
+        assert_eq!(app.cursor, 7);
+        press(&mut app, KeyCode::Char('G'));
+        draw(&mut app, 20, 9);
+        assert_eq!(app.scroll, 7);
+        press(&mut app, KeyCode::Char('g'));
+        draw(&mut app, 20, 9);
+        assert_eq!(app.scroll, 0);
     }
 
     #[test]
