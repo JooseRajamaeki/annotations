@@ -16,7 +16,7 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthChar;
 
 use crate::annotation::{read_text_file, save_annotation, save_path_annotation};
-use crate::markdown::{markdown_highlight, markdown_lines, MdLine};
+use crate::markdown::{markdown_highlight, Markdown, MdLine, CODE_INDENT};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -60,6 +60,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("v", "paint (select) lines"),
         ("c / Enter", "comment the line(s)"),
         ("f", "comment the whole file"),
+        ("m", "Markdown: rendered / source"),
         ("b", "browse files"),
         ("q", "quit"),
     ]),
@@ -141,8 +142,11 @@ pub struct App {
     contents: String,
     lines: Vec<String>,
     syntax: Syntax,
-    /// Code block state of each line, for Markdown files (empty otherwise).
-    md_lines: Vec<MdLine>,
+    /// The kind of each line, for Markdown files (empty otherwise).
+    markdown: Markdown,
+    /// Whether Markdown files are shown rendered rather than as source.
+    /// Kept when another file is opened.
+    render_markdown: bool,
     output_dir: PathBuf,
     cursor: usize,
     /// Start of the painted selection (0-based). `None` = no painting active.
@@ -474,7 +478,8 @@ impl App {
             contents: String::new(),
             lines: vec![String::new()],
             syntax: Syntax::Rust,
-            md_lines: Vec::new(),
+            markdown: Markdown::default(),
+            render_markdown: true,
             output_dir: output_dir.to_path_buf(),
             cursor: 0,
             anchor: None,
@@ -525,9 +530,9 @@ impl App {
             self.lines = vec![String::new()];
         }
         self.syntax = Syntax::for_path(path);
-        self.md_lines = match self.syntax {
-            Syntax::Markdown => markdown_lines(&self.lines),
-            Syntax::Rust => Vec::new(),
+        self.markdown = match self.syntax {
+            Syntax::Markdown => Markdown::parse(&self.lines),
+            Syntax::Rust => Markdown::default(),
         };
         self.contents = contents;
         self.mode = Mode::Normal;
@@ -643,7 +648,7 @@ impl App {
 
     /// Screen rows line `idx` takes when wrapped.
     fn line_rows(&self, idx: usize) -> usize {
-        wrap_starts(&self.lines[idx], self.text_width()).len()
+        self.display(idx, self.text_width()).1.len()
     }
 
     /// The first line of a view that ends with line `last` and fits in
@@ -689,7 +694,7 @@ impl App {
     /// Line `idx` of the open file, colored for its syntax.
     fn highlight(&self, idx: usize) -> Vec<Span<'_>> {
         let line = &self.lines[idx];
-        match (self.syntax, self.md_lines.get(idx)) {
+        match (self.syntax, self.markdown.kind(idx)) {
             (Syntax::Markdown, Some(MdLine::Text)) => markdown_highlight(line),
             (Syntax::Markdown, Some(MdLine::Fence)) => vec![Span::styled(line.as_str(), Style::default().fg(Color::DarkGray))],
             (Syntax::Markdown, Some(MdLine::Code { rust: false })) => {
@@ -697,6 +702,36 @@ impl App {
             }
             _ => syntax_highlight(line),
         }
+    }
+
+    fn toggle_markdown(&mut self) {
+        if self.syntax == Syntax::Markdown {
+            self.render_markdown = !self.render_markdown;
+            let shown = if self.render_markdown { "rendered" } else { "source" };
+            self.status = format!("showing Markdown {shown} — m to switch");
+        }
+    }
+
+    /// Whether the open file is Markdown shown rendered.
+    fn rendering(&self) -> bool {
+        self.syntax == Syntax::Markdown && self.render_markdown
+    }
+
+    /// Line `idx` as drawn, `width` columns wide: its spans and the byte
+    /// offsets (into the spans' joined text) where its screen rows start.
+    fn display(&self, idx: usize, width: usize) -> (Vec<Span<'_>>, Vec<usize>) {
+        if !self.rendering() {
+            return (self.highlight(idx), wrap_starts(&self.lines[idx], width));
+        }
+        let spans = self.markdown.render(idx, &self.lines[idx], width).unwrap_or_else(|| {
+            // Code block lines keep their source colors.
+            let mut spans = vec![Span::raw(CODE_INDENT)];
+            spans.extend(self.highlight(idx));
+            spans
+        });
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let starts = wrap_starts(&text, width);
+        (spans, starts)
     }
 
     /// Whether a comment is being written or saved (the editor or the name prompt).
@@ -818,6 +853,7 @@ impl App {
                         self.start_editing(CommentTarget::Path(file));
                     }
                 }
+                KeyCode::Char('m') => self.toggle_markdown(),
                 KeyCode::Char('b') => self.open_browser(),
                 _ => {}
             },
@@ -980,6 +1016,11 @@ impl App {
     /// Kept within 80 columns; `?` lists everything.
     fn key_hints(&self) -> String {
         match self.mode {
+            // Markdown files need room for `m`, so their hints are shorter.
+            Mode::Normal if self.syntax == Syntax::Markdown => {
+                let other = if self.render_markdown { "source" } else { "render" };
+                format!("? help · v paint · c comment · f comment file · m {other} · b browse · q quit")
+            }
             Mode::Normal => "? help · v paint lines · c comment line(s) · f comment file · b browse · q quit".to_string(),
             Mode::Visual => "? help · j/k extend · c comment selection · v/Esc stop painting".to_string(),
             Mode::Editing => "Esc save · Ctrl+Q discard · Enter new line · ←/→ move cursor".to_string(),
@@ -1047,8 +1088,13 @@ fn render(frame: &mut Frame, app: &mut App) {
     let title = if app.browsing() {
         format!(" Browse: {} ", app.browser_path.display())
     } else {
+        let view = match (app.syntax, app.render_markdown) {
+            (Syntax::Markdown, true) => " (rendered)",
+            (Syntax::Markdown, false) => " (source)",
+            _ => "",
+        };
         format!(
-            " {}  {} lines ",
+            " {}  {} lines{view} ",
             app.file.as_ref().map_or("No file".to_string(), |f| f.display().to_string()),
             app.lines.len()
         )
@@ -1181,7 +1227,8 @@ fn render_file(frame: &mut Frame, app: &mut App, body_area: Rect) {
         };
         let marker = if selected { ">" } else { " " };
 
-        let rows = split_rows(app.highlight(idx), &wrap_starts(&app.lines[idx], width));
+        let (spans, starts) = app.display(idx, width);
+        let rows = split_rows(spans, &starts);
         for (r, row) in rows.into_iter().enumerate().take(visible - body_lines.len()) {
             let number = if r == 0 { lineno.to_string() } else { WRAP_MARK.to_string() };
             let mut spans = vec![Span::styled(format!("{marker}{number:>gutter$} "), Style::default().fg(Color::DarkGray))];
@@ -1333,9 +1380,10 @@ mod tests {
     }
 
     #[test]
-    fn markdown_files_are_drawn_with_markdown_colors() {
+    fn markdown_source_is_drawn_with_markdown_colors() {
         let text = "# Title\nfn is a word here\n```rs\nfn main() {}\n```\n";
         let mut app = App::new(Path::new("notes.MD"), text, Path::new("out"));
+        press(&mut app, KeyCode::Char('m'));
         app.cursor = 4; // keep the cursor's bold off the lines under test
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -1349,7 +1397,7 @@ mod tests {
 
         let rust = App::new(Path::new("main.rs"), text, Path::new("out"));
         assert_eq!(rust.syntax, Syntax::Rust);
-        assert!(rust.md_lines.is_empty());
+        assert!(rust.markdown.kind(0).is_none());
     }
 
     fn chars(s: &str) -> Vec<char> {
@@ -1446,6 +1494,80 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         let (rows, _) = draw(&mut app, 20, 8);
         assert!(rows[2].starts_with(">  1") && rows[3].starts_with(">  ↪"), "{rows:#?}");
+    }
+
+    #[test]
+    fn markdown_is_rendered_in_place_and_m_shows_the_source() {
+        let text = "# Title\n\nSome **bold** text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n```rs\nfn main() {}\n```\n";
+        let mut app = App::new(Path::new("x.md"), text, Path::new("out"));
+        let (rows, _) = draw(&mut app, 80, 14);
+        assert!(rows[0].contains("x.md  10 lines (rendered)"), "{}", rows[0]);
+        assert!(rows[1].contains("m source"), "{}", rows[1]);
+        let body: Vec<&str> = rows[2..12].iter().map(|r| r.trim_end()).collect();
+        assert_eq!(
+            body,
+            [
+                "   1 Title",
+                "   2",
+                "   3 Some bold text",
+                "   4",
+                "   5 a │ b",
+                "   6 ──┼──",
+                "   7 1 │ 2",
+                "   8   rs",
+                "   9   fn main() {}",
+                "  10",
+            ]
+        );
+
+        press(&mut app, KeyCode::Char('m'));
+        let (rows, _) = draw(&mut app, 80, 14);
+        assert!(rows[0].contains("(source)"), "{}", rows[0]);
+        assert!(rows[1].contains("m render"), "{}", rows[1]);
+        assert_eq!(rows[2].trim_end(), "   1 # Title");
+        assert_eq!(rows[6].trim_end(), "   5 | a | b |");
+        assert!(app.status.contains("source"), "{}", app.status);
+
+        // The choice holds for the next Markdown file; other files ignore `m`.
+        app.load_file(Path::new("y.md"), "**y**\n".to_string());
+        assert_eq!(draw(&mut app, 80, 14).0[2].trim_end(), "   1 **y**");
+        app.load_file(Path::new("z.rs"), "fn z() {}\n".to_string());
+        press(&mut app, KeyCode::Char('m'));
+        assert!(!app.render_markdown);
+        let (rows, _) = draw(&mut app, 80, 14);
+        assert!(!rows[0].contains("(source)") && !rows[1].contains("m render"), "{rows:#?}");
+    }
+
+    #[test]
+    fn painting_rendered_markdown_saves_the_source_lines() {
+        let dir = temp_dir();
+        let text = "# Title\n- **one**\n";
+        let mut app = App::new(&dir.join("x.md"), text, &dir.join("out"));
+        app.user = Some("me".to_string());
+        draw(&mut app, 40, 10);
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "note");
+        press(&mut app, KeyCode::Esc);
+        let saved = fs::read_to_string(&saved_files(&dir.join("out"))[0]).unwrap();
+        assert!(saved.contains("x.md#L1-2`"), "{saved}");
+        assert!(saved.contains("# Title\n- **one**\n"), "{saved}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rows_of_wrapped_rendered_lines_map_back_to_their_line() {
+        // Rendered, the link is short and fits; as source it wraps.
+        let text = "[a](https://example.com/a/long/address)\nnext\n";
+        let mut app = App::new(Path::new("x.md"), text, Path::new("out"));
+        draw(&mut app, 25, 8);
+        assert_eq!(app.row_lines, [0, 1]);
+        press(&mut app, KeyCode::Char('m'));
+        draw(&mut app, 25, 8);
+        assert_eq!(app.row_lines, [0, 0, 1]);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4);
+        assert_eq!(app.cursor, 1, "the row under the click is line 2");
     }
 
     #[test]
@@ -1655,11 +1777,16 @@ mod tests {
 
     #[test]
     fn key_hints_fit_in_80_columns() {
-        let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
-        for mode in [Mode::Normal, Mode::Visual, Mode::Editing, Mode::Naming, Mode::ConfirmNoName, Mode::FileBrowser] {
-            app.mode = mode;
-            let width = app.key_hints().chars().count();
-            assert!(width <= 80, "{mode:?} hints are {width} columns");
+        for file in ["x.rs", "x.md"] {
+            let mut app = App::new(Path::new(file), "a\n", Path::new("out"));
+            for render_markdown in [true, false] {
+                app.render_markdown = render_markdown;
+                for mode in [Mode::Normal, Mode::Visual, Mode::Editing, Mode::Naming, Mode::ConfirmNoName, Mode::FileBrowser] {
+                    app.mode = mode;
+                    let width = app.key_hints().chars().count();
+                    assert!(width <= 80, "{file} {mode:?} hints are {width} columns");
+                }
+            }
         }
     }
 
