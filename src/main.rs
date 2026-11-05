@@ -1,5 +1,6 @@
 mod annotation;
 mod app;
+mod markdown;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
