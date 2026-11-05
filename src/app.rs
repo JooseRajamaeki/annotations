@@ -1507,7 +1507,7 @@ mod tests {
         assert_eq!(
             body,
             [
-                "   1 Title",
+                "   1  Title",
                 "   2",
                 "   3 Some bold text",
                 "   4",

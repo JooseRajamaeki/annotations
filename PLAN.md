@@ -55,7 +55,10 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   lines. The cost is that hard-wrapped paragraphs are not reflowed and setext
   headings are not joined. Markup is hidden (`#`, `**`, backticks, link URLs),
   bullets become `•`, quotes a bar, rules span the width, table columns line
-  up, and code blocks keep their colors with a small indent
+  up, and code blocks keep their colors with a small indent. A terminal cannot
+  change the font size, so heading levels differ in style: H1 is a full-width
+  bar, H2 and H3 are followed by a heavy and a thin line, H4 is cyan, H5 plain
+  bold and H6 dim
 - **Scopes**: an annotation is about a line range (TUI painting or
   `<file> --lines A-B`), a whole file (TUI `f` / browser `c`, or `--path FILE`)
   or a whole directory (browser `c`/`C`, or `--path DIR`). A directory gets one

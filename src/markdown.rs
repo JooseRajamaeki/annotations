@@ -393,6 +393,39 @@ fn render_table_row(line: &str, table: &Table, delimiter: bool) -> Vec<Span<'sta
     spans
 }
 
+/// A heading of `level` 1 to 6. A terminal cannot change the font size, so
+/// the levels differ in how much of the row they claim: H1 is a full-width
+/// bar, H2 and H3 are followed by a heavy and a thin line, and H4 to H6 fade
+/// from colored to plain to dim.
+fn render_heading(level: usize, content: &str, width: usize) -> Vec<Span<'static>> {
+    let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    // Reversed rather than a background color, so the bar stays readable
+    // when the cursor line's background is drawn over it.
+    let bar = cyan.add_modifier(Modifier::REVERSED);
+    let style = match level {
+        1 => bar,
+        2..=4 => cyan,
+        5 => Style::default().add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    };
+    let mut spans = Vec::new();
+    if level == 1 {
+        spans.push(Span::styled(" ", bar));
+    }
+    render_inline(content, style, &mut spans);
+    let used: usize = spans.iter().map(Span::width).sum();
+    // The fill only goes on headings that fit on one row; on a wrapped one it
+    // would add a row of its own.
+    let fill = width.saturating_sub(used + 1);
+    match level {
+        1 => spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), bar)),
+        2 if fill > 0 => spans.push(Span::styled(format!(" {}", "━".repeat(fill)), cyan)),
+        3 if fill > 0 => spans.push(Span::styled(format!(" {}", "─".repeat(fill)), Style::default().fg(Color::DarkGray))),
+        _ => {}
+    }
+    spans
+}
+
 /// A line of Markdown text (not in a code block or a table) with its markup
 /// replaced by styles: headings lose their `#`s, bullets become `•`, quotes a
 /// bar, rules span `width` columns.
@@ -400,17 +433,11 @@ fn render_text(line: &str, width: usize) -> Vec<Span<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let trimmed = line.trim_start();
     if let Some(level) = heading_level(trimmed) {
-        let mut style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-        if level == 1 {
-            style = style.add_modifier(Modifier::UNDERLINED);
-        }
         let content = trimmed[level..].trim();
         // An optional closing run of `#`s is not part of the heading.
         let unclosed = content.trim_end_matches('#');
         let content = if unclosed.is_empty() || unclosed.ends_with(' ') { unclosed.trim_end() } else { content };
-        let mut spans = Vec::new();
-        render_inline(content, style, &mut spans);
-        return spans;
+        return render_heading(level, content, width);
     }
     if is_rule(trimmed) {
         return vec![Span::styled("─".repeat(width), dim)];
@@ -621,13 +648,8 @@ mod tests {
 
     #[test]
     fn rendered_headings_rules_quotes_and_lists_lose_their_markup() {
-        let h1 = render_line("# Title");
-        assert_eq!(text(&h1), "Title");
-        assert!(h1[0].style.add_modifier.contains(Modifier::BOLD | Modifier::UNDERLINED));
-        let h2 = render_line("## Usage ##");
-        assert_eq!(text(&h2), "Usage", "the closing #s go too");
-        assert!(!h2[0].style.add_modifier.contains(Modifier::UNDERLINED));
-        assert_eq!(text(&render_line("## C#")), "C#", "a # inside a word stays");
+        assert_eq!(text(&render_line("#### Usage ##")), "Usage", "the closing #s go too");
+        assert_eq!(text(&render_line("#### C#")), "C#", "a # inside a word stays");
         assert_eq!(text(&render_line("#hashtag")), "#hashtag");
 
         assert_eq!(text(&render_line("---")), "─".repeat(20), "a rule spans the width");
@@ -635,6 +657,36 @@ mod tests {
         assert_eq!(style_of(&render_line("* item"), "• ").fg, Some(Color::Magenta));
         assert_eq!(text(&render_line("12. item")), "12. item");
         assert_eq!(text(&render_line("> > - quoted")), "│ │ • quoted");
+    }
+
+    #[test]
+    fn each_heading_level_looks_different() {
+        // Rendered 20 columns wide.
+        let shown: Vec<String> = (1..=6).map(|n| text(&render_line(&format!("{} Title", "#".repeat(n))))).collect();
+        assert_eq!(
+            shown,
+            [
+                " Title              ".to_string(),
+                format!("Title {}", "━".repeat(14)),
+                format!("Title {}", "─".repeat(14)),
+                "Title".to_string(),
+                "Title".to_string(),
+                "Title".to_string(),
+            ]
+        );
+        let style = |n: usize| style_of(&render_line(&format!("{} Title", "#".repeat(n))), "Title");
+        let styles: Vec<Style> = (1..=6).map(style).collect();
+        assert!(styles[0].add_modifier.contains(Modifier::REVERSED), "H1 is a bar");
+        for (i, a) in styles.iter().enumerate() {
+            assert!(a.add_modifier.contains(Modifier::BOLD) || i == 5, "H{} is bold", i + 1);
+        }
+        assert_eq!(styles[3].fg, Some(Color::Cyan));
+        assert_eq!(styles[4].fg, None, "H5 is plain bold");
+        assert!(styles[5].add_modifier.contains(Modifier::ITALIC) && styles[5].fg == Some(Color::DarkGray));
+
+        // A heading too long for one row gets no line, which would take a row of its own.
+        let long = render_line("## A heading longer than the row");
+        assert_eq!(text(&long), "A heading longer than the row");
     }
 
     #[test]
