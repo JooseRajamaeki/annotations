@@ -35,7 +35,7 @@ The second line of the header always shows the main keys for what you are doing,
 
 | Key | Action |
 |---|---|
-| `j`/`k`, `↑`/`↓` | move |
+| `j`/`k`, `↑`/`↓` | move (`g`/`G` top/bottom) |
 | `v` | select (paint) lines |
 | `c` / `Enter` | comment on the selected line(s) |
 | `f` | comment on the whole file |
@@ -101,6 +101,14 @@ This could be a loop
 - **Context**: a copy of the selected lines, so the note still makes sense
   after the code changes. Only line annotations have it.
 
+## Feedback
+
+Found a bug or have an idea for annotator? Open an issue at
+https://github.com/JooseRajamaeki/annotations/issues
+
+Design decisions are recorded in
+[architectural-decision-record.md](architectural-decision-record.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
@@ -109,3 +117,4 @@ MIT, see [LICENSE](LICENSE).
 
 Edited by Claude Opus 5.5 a6ce3c44-4635-42c0-b6c3-48e952313d1c
 Edited by Mistral Vibe d2783d7a-6011-9d53-ac2c-5c3a8804ace6
+Edited by Mistral Vibe mistral-large-4 1fd3b04c-5d71-4583-34b1-6fe588bbfe5d
