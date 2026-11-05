@@ -34,8 +34,9 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
     selected file or directory, `C` comment the current directory, `Esc` back
     to the open file, `q` quit
   - Note editor: title says what is being commented on; `Esc` save, `Ctrl+Q`
-    discard (back to where you were), `Enter` newline, `←`/`→` move; text
-    word-wraps and the box grows up to half the screen, then scrolls
+    discard (back to where you were), `Enter` newline, `←`/`→` or a click place
+    the cursor; text word-wraps and the box grows up to half the screen, then
+    scrolls
   - Name prompt: the first save of a session asks the user's name, used for
     every annotation until quitting (no config file, so it is not remembered
     between runs). `Enter` saves, `Esc` goes back to the comment. A blank name
@@ -44,8 +45,9 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
     to stay on screen, so while painting it extends the selection); in the
     file view a click moves to a line and dragging with the left button paints
     lines (dragging past the top/bottom edge scrolls); in the browser a click
-    selects an entry and clicking the selected entry opens it. Ignored while
-    writing a comment. Mouse capture means terminal text selection needs the
+    selects an entry and clicking the selected entry opens it. While writing a
+    comment the file stays put, but a click in the comment box places the text
+    cursor. Mouse capture means terminal text selection needs the
     terminal's modifier (e.g. Shift, or Option in iTerm2)
   - `annotator` starts in the browser at the working directory,
     `annotator <file>` starts in the file view
@@ -204,6 +206,9 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   `src/markdown.rs`
 - 2026-11-05 — Heading levels look different (H1 bar, H2/H3 lines, H4-H6 fading). Links show a
   tooltip on hover and open with a click on the cursor line or `o`
+- 2026-11-05 — Left click (or drag) inside the comment box places the text cursor at the clicked
+  position ([#8](https://github.com/JooseRajamaeki/annotations/issues/8)); the rest of the mouse
+  stays ignored while writing
 
 ## Feedback from User Testing
 
@@ -219,6 +224,8 @@ Issues and feature requests collected from annotation files in `annotations/`
   location.)
 
 ### UX Improvements (Addressed)
+- **Mouse in comment mode** ([#8](https://github.com/JooseRajamaeki/annotations/issues/8)): a left
+  click or drag in the comment box places the text cursor where it lands
 - **Visual mode key** [`2792dba9`]: lowercase `v` starts/stops painting (`V` still works)
 - **Line wrapping in the comment box** [`437fa259`]: the editor word-wraps, grows up to half
   the screen and then scrolls to keep the cursor visible
@@ -259,3 +266,4 @@ Issues and feature requests collected from annotation files in `annotations/`
 ---
 
 Edited by Claude Opus 5.5 a6ce3c44-4635-42c0-b6c3-48e952313d1c
+Edited by Mistral Vibe d2783d7a-6011-9d53-ac2c-5c3a8804ace6

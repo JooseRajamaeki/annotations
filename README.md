@@ -55,7 +55,7 @@ files and directories open in annotator, and `#heading` links jump to the
 heading. Other links, such as `file:` ones, are not opened, so a link cannot
 start a program.
 
-The mouse works too. Scroll with the wheel, click to move to a line, and drag to select lines. In the file browser, click to select an entry and click it again to open it. Because annotator captures the mouse, selecting text in the terminal needs your terminal's modifier key (usually Shift, or Option in iTerm2).
+The mouse works too. Scroll with the wheel, click to move to a line, and drag to select lines. In the file browser, click to select an entry and click it again to open it. While writing a comment, click in the comment box to place the cursor. Because annotator captures the mouse, selecting text in the terminal needs your terminal's modifier key (usually Shift, or Option in iTerm2).
 
 ### Without the interface
 
@@ -108,3 +108,4 @@ MIT, see [LICENSE](LICENSE).
 ---
 
 Edited by Claude Opus 5.5 a6ce3c44-4635-42c0-b6c3-48e952313d1c
+Edited by Mistral Vibe d2783d7a-6011-9d53-ac2c-5c3a8804ace6

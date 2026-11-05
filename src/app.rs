@@ -86,6 +86,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Ctrl+Q", "discard"),
         ("Enter", "new line"),
         ("← / →", "move the cursor"),
+        ("click", "place the cursor in the text"),
     ]),
     ("Your name (asked at the first save)", &[
         ("Enter", "save with this name"),
@@ -218,6 +219,12 @@ pub struct App {
     /// Line (0-based) drawn on each row of the body, as wrapped lines take
     /// several rows.
     row_lines: Vec<usize>,
+    /// Where the note editor box was last drawn, for mouse hit-testing.
+    note_area: Rect,
+    /// Wrapped rows of the note scrolled off the top of the note box.
+    note_scroll: usize,
+    /// Char index range of each wrapped row of the note, as last drawn.
+    note_ranges: Vec<(usize, usize)>,
     /// Line (0-based) the left mouse button was pressed on, while it is held.
     drag_from: Option<usize>,
     /// Last mouse position (column, row), for the link tooltip.
@@ -395,6 +402,8 @@ fn edit_text(text: &mut Vec<char>, cursor: &mut usize, code: KeyCode) {
 /// The comment text laid out in rows of at most `width` characters.
 struct WrappedNote {
     rows: Vec<String>,
+    /// Char index range of each row into `note`, newlines excluded.
+    ranges: Vec<(usize, usize)>,
     /// Cursor position as (row, column) within `rows`.
     cursor: (usize, usize),
 }
@@ -447,7 +456,7 @@ fn wrap_note(note: &[char], cursor: usize, width: usize) -> WrappedNote {
             rows.push(String::new());
         }
     }
-    WrappedNote { rows, cursor: cursor_pos }
+    WrappedNote { rows, ranges, cursor: cursor_pos }
 }
 
 /// Columns `c` takes on screen. ratatui does not draw control chars such as tabs.
@@ -548,6 +557,9 @@ impl App {
             browser_scroll: 0,
             body_area: Rect::default(),
             row_lines: Vec::new(),
+            note_area: Rect::default(),
+            note_scroll: 0,
+            note_ranges: Vec::new(),
             drag_from: None,
             mouse_at: None,
             pressed_link: None,
@@ -1114,6 +1126,30 @@ impl App {
         }
     }
 
+    /// Place the note cursor at the clicked cell, when it is inside the note
+    /// box. Clicking past the end of a row puts the cursor at the row's end,
+    /// and below the last row at the end of the note.
+    fn place_note_cursor(&mut self, column: u16, row: u16) {
+        let inner = Rect::new(
+            self.note_area.x + 1,
+            self.note_area.y + 1,
+            self.note_area.width.saturating_sub(2),
+            self.note_area.height.saturating_sub(2),
+        );
+        if !inner.contains(Position::new(column, row)) {
+            return;
+        }
+        let wrapped_row = self.note_scroll + (row - inner.y) as usize;
+        self.note_cursor = match self.note_ranges.get(wrapped_row) {
+            Some(&(start, end)) => {
+                // A row is drawn as its range up to the box width.
+                let drawn = (end - start).min(inner.width as usize);
+                start + ((column - inner.x) as usize).min(drawn)
+            }
+            None => self.note.len(),
+        };
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.show_help {
             // Any click closes the help screen, like any key.
@@ -1196,8 +1232,18 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::Editing => match mouse.kind {
+                // A click in the note box places the text cursor where it lands.
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.place_note_cursor(mouse.column, mouse.row);
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.place_note_cursor(mouse.column, mouse.row);
+                }
+                _ => {}
+            },
             // The comment is about the painted lines, so they stay put while writing.
-            Mode::Editing | Mode::Naming | Mode::ConfirmNoName | Mode::PickLink => {}
+            Mode::Naming | Mode::ConfirmNoName | Mode::PickLink => {}
         }
     }
 
@@ -1302,6 +1348,10 @@ fn render(frame: &mut Frame, app: &mut App) {
     ];
     frame.render_widget(Paragraph::new(header), header_area);
     app.body_area = body_area;
+    // Replaced below when the note editor is drawn.
+    app.note_area = Rect::default();
+    app.note_scroll = 0;
+    app.note_ranges.clear();
 
     let position = if app.browsing() {
         render_browser(frame, app, body_area);
@@ -1327,9 +1377,13 @@ fn render(frame: &mut Frame, app: &mut App) {
     if let Some(wrapped) = wrapped_note {
         let input_area = chunks[3];
         // Scroll so the cursor row stays visible.
-        let (cursor_row, cursor_col) = wrapped.cursor;
+        let WrappedNote { rows, ranges, cursor: (cursor_row, cursor_col) } = wrapped;
         let scroll = cursor_row.saturating_sub(note_rows - 1);
-        let lines: Vec<Line> = wrapped.rows.into_iter().skip(scroll).take(note_rows).map(Line::from).collect();
+        // Remember the layout so a click can place the cursor in the text.
+        app.note_area = input_area;
+        app.note_scroll = scroll;
+        app.note_ranges = ranges;
+        let lines: Vec<Line> = rows.into_iter().skip(scroll).take(note_rows).map(Line::from).collect();
         let title = format!("Comment on {} — Esc save · Ctrl+Q discard", app.target_label());
         let input = Paragraph::new(lines).block(Block::bordered().title(title));
         frame.render_widget(input, input_area);
@@ -2358,7 +2412,7 @@ mod tests {
     // --- Mouse: `draw` first so the app knows where the body is. ---
 
     fn mouse(app: &mut App, kind: MouseEventKind, row: u16) {
-        app.handle_mouse(MouseEvent { kind, column: 8, row, modifiers: KeyModifiers::NONE });
+        mouse_at(app, kind, 8, row);
     }
 
     fn numbered_lines(n: usize) -> String {
@@ -2529,6 +2583,51 @@ mod tests {
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5);
         assert!(!app.show_help);
         assert_eq!(app.cursor, 0, "the click that closes help is not acted on");
+    }
+
+    #[test]
+    fn click_in_the_comment_box_places_the_note_cursor() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(5), Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "hello world\nsecond line");
+        assert_eq!(app.note_cursor, 23);
+        draw(&mut app, 40, 12);
+        // The note box is rows 8..=11; its text rows are 9 and 10.
+        assert_eq!(app.note_area, Rect::new(0, 8, 40, 4));
+
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 6, 9);
+        assert_eq!(app.note_cursor, 5, "clicked between 'hello' and ' world'");
+
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 1, 10);
+        assert_eq!(app.note_cursor, 12, "start of the second row");
+
+        // Past the end of a row: the cursor stops at the row's end.
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 30, 9);
+        assert_eq!(app.note_cursor, 11);
+
+        // Dragging inside the box moves the cursor along.
+        mouse_at(&mut app, MouseEventKind::Drag(MouseButton::Left), 8, 10);
+        assert_eq!(app.note_cursor, 19);
+
+        // Clicks outside the box leave the note and the file behind alone.
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 8, 4);
+        assert_eq!(app.note_cursor, 19);
+        assert_eq!((app.scroll, app.cursor), (0, 0));
+        assert!(app.mode == Mode::Editing);
+    }
+
+    #[test]
+    fn click_below_the_last_note_row_puts_the_cursor_at_the_end() {
+        let mut app = App::new(Path::new("x.rs"), &numbered_lines(5), Path::new("out"));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "0123456789"); // exactly one full row at width 12
+        draw(&mut app, 12, 12);
+        assert_eq!(app.note_area, Rect::new(0, 8, 12, 4));
+
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 5, 10); // the empty row after the full one
+        assert_eq!(app.note_cursor, 10);
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 5, 9);
+        assert_eq!(app.note_cursor, 4);
     }
 
     // --- Links in rendered Markdown. ---
