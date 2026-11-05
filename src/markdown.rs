@@ -226,6 +226,47 @@ fn markdown_inline<'a>(line: &'a str, mut pos: usize, spans: &mut Vec<Span<'a>>)
 /// Rendered code blocks are indented so they stand apart from the text.
 pub const CODE_INDENT: &str = "  ";
 
+/// A rendered line: its spans, and where its links are in their joined text.
+#[derive(Default, Debug)]
+pub struct Rendered {
+    pub spans: Vec<Span<'static>>,
+    pub links: Vec<Link>,
+    /// Byte length of the joined text, where the next span starts.
+    len: usize,
+}
+
+/// A link in a rendered line.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Link {
+    /// Bytes of the joined text of the line's spans.
+    pub range: std::ops::Range<usize>,
+    pub url: String,
+}
+
+impl Rendered {
+    fn push(&mut self, content: impl Into<String>, style: Style) {
+        let content = content.into();
+        self.len += content.len();
+        self.spans.push(Span::styled(content, style));
+    }
+
+    fn append(&mut self, other: Rendered) {
+        let shift = self.len;
+        self.links.extend(other.links.into_iter().map(|l| Link { range: l.range.start + shift..l.range.end + shift, url: l.url }));
+        self.len += other.len;
+        self.spans.extend(other.spans);
+    }
+
+    fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+
+    /// The joined text of the spans, as drawn.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+}
+
 /// Alignment of a table column, from its delimiter row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Align {
@@ -295,17 +336,52 @@ impl Markdown {
 
     /// Line `idx` (`line`) rendered for reading, `width` columns wide. `None`
     /// for code block lines, which are drawn as they are.
-    pub fn render(&self, idx: usize, line: &str, width: usize) -> Option<Vec<Span<'static>>> {
-        let dim = Style::default().fg(Color::DarkGray);
+    pub fn render(&self, idx: usize, line: &str, width: usize) -> Option<Rendered> {
         if let Some(row) = self.table_rows.get(idx).copied().flatten() {
             return Some(render_table_row(line, &self.tables[row.table], row.delimiter));
         }
+        let mut out = Rendered::default();
         match self.kind(idx)? {
-            MdLine::Text => Some(render_text(line, width)),
+            MdLine::Text => render_text(line, width, &mut out),
             // The opening fence shows the language; the closing one is blank.
-            MdLine::Fence => Some(vec![Span::styled(format!("{CODE_INDENT}{}", code_fence(line).map_or("", |f| f.2)), dim)]),
-            MdLine::Code { .. } => None,
+            MdLine::Fence => {
+                let info = code_fence(line).map_or("", |f| f.2);
+                out.push(format!("{CODE_INDENT}{info}"), Style::default().fg(Color::DarkGray));
+            }
+            MdLine::Code { .. } => return None,
         }
+        Some(out)
+    }
+
+    /// The line of the heading that the link `#anchor` points to. Anchors
+    /// are made from the heading text the way GitHub makes them.
+    pub fn anchor_line(&self, lines: &[String], anchor: &str) -> Option<usize> {
+        let anchor = anchor.to_lowercase();
+        let mut seen = std::collections::HashMap::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(level) = heading_level(trimmed).filter(|_| self.kind(idx) == Some(MdLine::Text)) else {
+                continue;
+            };
+            let mut out = Rendered::default();
+            render_inline(heading_text(trimmed, level), Style::default(), &mut out);
+            let base: String = out
+                .text()
+                .trim()
+                .to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+                .map(|c| if c == ' ' { '-' } else { c })
+                .collect();
+            // Repeated headings get -1, -2, ... after the first.
+            let count = seen.entry(base.clone()).or_insert(0);
+            let slug = if *count == 0 { base } else { format!("{base}-{count}") };
+            *count += 1;
+            if slug == anchor {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 
@@ -361,43 +437,44 @@ fn delimiter_row(line: &str) -> Option<Vec<Align>> {
 }
 
 fn inline_width(text: &str) -> usize {
-    let mut spans = Vec::new();
-    render_inline(text, Style::default(), &mut spans);
-    spans.iter().map(Span::width).sum()
+    let mut out = Rendered::default();
+    render_inline(text, Style::default(), &mut out);
+    out.width()
 }
 
-fn render_table_row(line: &str, table: &Table, delimiter: bool) -> Vec<Span<'static>> {
+fn render_table_row(line: &str, table: &Table, delimiter: bool) -> Rendered {
     let dim = Style::default().fg(Color::DarkGray);
+    let mut out = Rendered::default();
     if delimiter {
         let rule: Vec<String> = table.widths.iter().map(|&w| "─".repeat(w)).collect();
-        return vec![Span::styled(rule.join("─┼─"), dim)];
+        out.push(rule.join("─┼─"), dim);
+        return out;
     }
     let cells = split_cells(line);
-    let mut spans = Vec::new();
     for (col, (&width, &align)) in table.widths.iter().zip(&table.aligns).enumerate() {
         if col > 0 {
-            spans.push(Span::styled(" │ ", dim));
+            out.push(" │ ", dim);
         }
-        let mut cell = Vec::new();
+        let mut cell = Rendered::default();
         render_inline(cells.get(col).copied().unwrap_or(""), Style::default(), &mut cell);
-        let pad = width.saturating_sub(cell.iter().map(Span::width).sum());
+        let pad = width.saturating_sub(cell.width());
         let before = match align {
             Align::Left => 0,
             Align::Center => pad / 2,
             Align::Right => pad,
         };
-        spans.push(Span::raw(" ".repeat(before)));
-        spans.extend(cell);
-        spans.push(Span::raw(" ".repeat(pad - before)));
+        out.push(" ".repeat(before), Style::default());
+        out.append(cell);
+        out.push(" ".repeat(pad - before), Style::default());
     }
-    spans
+    out
 }
 
 /// A heading of `level` 1 to 6. A terminal cannot change the font size, so
 /// the levels differ in how much of the row they claim: H1 is a full-width
 /// bar, H2 and H3 are followed by a heavy and a thin line, and H4 to H6 fade
 /// from colored to plain to dim.
-fn render_heading(level: usize, content: &str, width: usize) -> Vec<Span<'static>> {
+fn render_heading(level: usize, content: &str, width: usize, out: &mut Rendered) {
     let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     // Reversed rather than a background color, so the bar stays readable
     // when the cursor line's background is drawn over it.
@@ -408,64 +485,64 @@ fn render_heading(level: usize, content: &str, width: usize) -> Vec<Span<'static
         5 => Style::default().add_modifier(Modifier::BOLD),
         _ => Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
     };
-    let mut spans = Vec::new();
     if level == 1 {
-        spans.push(Span::styled(" ", bar));
+        out.push(" ", bar);
     }
-    render_inline(content, style, &mut spans);
-    let used: usize = spans.iter().map(Span::width).sum();
+    render_inline(content, style, out);
+    let used = out.width();
     // The fill only goes on headings that fit on one row; on a wrapped one it
     // would add a row of its own.
     let fill = width.saturating_sub(used + 1);
     match level {
-        1 => spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), bar)),
-        2 if fill > 0 => spans.push(Span::styled(format!(" {}", "━".repeat(fill)), cyan)),
-        3 if fill > 0 => spans.push(Span::styled(format!(" {}", "─".repeat(fill)), Style::default().fg(Color::DarkGray))),
+        1 => out.push(" ".repeat(width.saturating_sub(used)), bar),
+        2 if fill > 0 => out.push(format!(" {}", "━".repeat(fill)), cyan),
+        3 if fill > 0 => out.push(format!(" {}", "─".repeat(fill)), Style::default().fg(Color::DarkGray)),
         _ => {}
     }
-    spans
+}
+
+/// The text of a heading line (indentation removed) of `level`, without its
+/// `#`s or an optional closing run of them.
+fn heading_text(trimmed: &str, level: usize) -> &str {
+    let content = trimmed[level..].trim();
+    let unclosed = content.trim_end_matches('#');
+    if unclosed.is_empty() || unclosed.ends_with(' ') { unclosed.trim_end() } else { content }
 }
 
 /// A line of Markdown text (not in a code block or a table) with its markup
 /// replaced by styles: headings lose their `#`s, bullets become `•`, quotes a
 /// bar, rules span `width` columns.
-fn render_text(line: &str, width: usize) -> Vec<Span<'static>> {
+fn render_text(line: &str, width: usize, out: &mut Rendered) {
     let dim = Style::default().fg(Color::DarkGray);
     let trimmed = line.trim_start();
     if let Some(level) = heading_level(trimmed) {
-        let content = trimmed[level..].trim();
-        // An optional closing run of `#`s is not part of the heading.
-        let unclosed = content.trim_end_matches('#');
-        let content = if unclosed.is_empty() || unclosed.ends_with(' ') { unclosed.trim_end() } else { content };
-        return render_heading(level, content, width);
+        return render_heading(level, heading_text(trimmed, level), width, out);
     }
     if is_rule(trimmed) {
-        return vec![Span::styled("─".repeat(width), dim)];
+        return out.push("─".repeat(width), dim);
     }
 
-    let mut spans = Vec::new();
     let mut pos = line.len() - trimmed.len();
     if pos > 0 {
-        spans.push(Span::raw(line[..pos].to_string()));
+        out.push(&line[..pos], Style::default());
     }
     while line[pos..].starts_with('>') {
-        spans.push(Span::styled("│ ", dim));
+        out.push("│ ", dim);
         pos += if line[pos + 1..].starts_with(' ') { 2 } else { 1 };
     }
     if let Some(len) = list_marker(&line[pos..]) {
         let marker = &line[pos..pos + len];
         let bullet = if len == 2 && !marker.starts_with(|c: char| c.is_ascii_digit()) { "• " } else { marker };
-        spans.push(Span::styled(bullet.to_string(), Style::default().fg(Color::Magenta)));
+        out.push(bullet, Style::default().fg(Color::Magenta));
         pos += len;
     }
-    render_inline(&line[pos..], Style::default(), &mut spans);
-    spans
+    render_inline(&line[pos..], Style::default(), out);
 }
 
 /// Inline Markdown in `text` with its markup hidden: code spans, links,
 /// images, autolinks, emphasis, strikethrough and escapes. Markup nests, so
 /// `**see `x`**` is bold with `x` as code.
-fn render_inline(text: &str, base: Style, spans: &mut Vec<Span<'static>>) {
+fn render_inline(text: &str, base: Style, out: &mut Rendered) {
     let code = base.patch(Style::default().fg(Color::Yellow));
     let link = base.patch(Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED));
     let dim = base.patch(Style::default().fg(Color::DarkGray));
@@ -473,41 +550,46 @@ fn render_inline(text: &str, base: Style, spans: &mut Vec<Span<'static>>) {
     let mut pos = 0;
     // Start of the plain text not yet pushed.
     let mut plain = 0;
-    let flush = |spans: &mut Vec<Span<'static>>, to: usize, plain: usize| {
+    let flush = |out: &mut Rendered, to: usize, plain: usize| {
         if plain < to {
-            spans.push(Span::styled(text[plain..to].to_string(), base));
+            out.push(&text[plain..to], base);
         }
     };
     while pos < text.len() {
         // Every marker is ASCII, so `pos` is a char boundary whenever it matches.
         match bytes[pos] {
             b'\\' if bytes.get(pos + 1).is_some_and(u8::is_ascii_punctuation) => {
-                flush(spans, pos, plain);
+                flush(out, pos, plain);
                 // The escaped char starts the next plain text and is not markup.
                 plain = pos + 1;
                 pos += 2;
             }
             b'`' => match code_span(text, pos) {
                 Ok((run, end)) => {
-                    flush(spans, pos, plain);
+                    flush(out, pos, plain);
                     let inner = &text[pos + run..end - run];
                     // CommonMark strips one space on each side, so `` ` `` can show a backtick.
                     let inner = match inner.strip_prefix(' ').and_then(|i| i.strip_suffix(' ')) {
                         Some(stripped) if !inner.trim().is_empty() => stripped,
                         _ => inner,
                     };
-                    spans.push(Span::styled(inner.to_string(), code));
+                    out.push(inner, code);
                     (pos, plain) = (end, end);
                 }
                 Err(run) => pos += run,
             },
             b'[' | b'!' => match link_at(text, pos) {
                 Some((text_start, url_start, end)) => {
-                    flush(spans, pos, plain);
+                    flush(out, pos, plain);
+                    let start = out.len;
                     if text_start > pos {
-                        spans.push(Span::styled("▣ ", dim));
+                        out.push("▣ ", dim);
                     }
-                    render_inline(&text[text_start + 1..url_start - 1], link, spans);
+                    render_inline(&text[text_start + 1..url_start - 1], link, out);
+                    // The destination may have a title after it: `(url "title")`.
+                    let dest = text[url_start + 1..end - 1].split_whitespace().next().unwrap_or("");
+                    let url = dest.strip_prefix('<').and_then(|d| d.strip_suffix('>')).unwrap_or(dest);
+                    out.links.push(Link { range: start..out.len, url: url.to_string() });
                     (pos, plain) = (end, end);
                 }
                 None => pos += 1,
@@ -516,8 +598,10 @@ fn render_inline(text: &str, base: Style, spans: &mut Vec<Span<'static>>) {
                 let url = text[pos + 1..].find('>').map(|i| &text[pos + 1..pos + 1 + i]);
                 match url.filter(|u| (u.starts_with("http://") || u.starts_with("https://")) && !u.contains(' ')) {
                     Some(url) => {
-                        flush(spans, pos, plain);
-                        spans.push(Span::styled(url.to_string(), link));
+                        flush(out, pos, plain);
+                        let start = out.len;
+                        out.push(url, link);
+                        out.links.push(Link { range: start..out.len, url: url.to_string() });
                         pos += url.len() + 2;
                         plain = pos;
                     }
@@ -535,9 +619,9 @@ fn render_inline(text: &str, base: Style, spans: &mut Vec<Span<'static>>) {
                 };
                 match modifier.and_then(|m| emphasis_end(text, pos, delim).map(|end| (m, end))) {
                     Some((modifier, end)) => {
-                        flush(spans, pos, plain);
+                        flush(out, pos, plain);
                         let inner = &text[pos + delim.len()..end - delim.len()];
-                        render_inline(inner, base.add_modifier(modifier), spans);
+                        render_inline(inner, base.add_modifier(modifier), out);
                         (pos, plain) = (end, end);
                     }
                     None => pos += delim.len(),
@@ -546,7 +630,7 @@ fn render_inline(text: &str, base: Style, spans: &mut Vec<Span<'static>>) {
             _ => pos += 1,
         }
     }
-    flush(spans, text.len(), plain);
+    flush(out, text.len(), plain);
 }
 
 #[cfg(test)]
@@ -637,13 +721,13 @@ mod tests {
 
     fn render_line(line: &str) -> Vec<Span<'static>> {
         let doc = Markdown::parse(&[line.to_string()]);
-        doc.render(0, line, 20).unwrap()
+        doc.render(0, line, 20).unwrap().spans
     }
 
     fn inline(line: &str) -> Vec<Span<'static>> {
-        let mut spans = Vec::new();
-        render_inline(line, Style::default(), &mut spans);
-        spans
+        let mut out = Rendered::default();
+        render_inline(line, Style::default(), &mut out);
+        out.spans
     }
 
     #[test]
@@ -736,16 +820,16 @@ mod tests {
     fn code_blocks_are_left_to_the_caller_and_fences_show_the_language() {
         let lines: Vec<String> = ["```rs", "# not a heading", "```"].map(String::from).to_vec();
         let doc = Markdown::parse(&lines);
-        assert_eq!(text(&doc.render(0, &lines[0], 20).unwrap()), format!("{CODE_INDENT}rs"));
+        assert_eq!(doc.render(0, &lines[0], 20).unwrap().text(), format!("{CODE_INDENT}rs"));
         assert!(doc.render(1, &lines[1], 20).is_none());
-        assert_eq!(text(&doc.render(2, &lines[2], 20).unwrap()), CODE_INDENT);
+        assert_eq!(doc.render(2, &lines[2], 20).unwrap().text(), CODE_INDENT);
         assert!(Markdown::default().render(0, "# x", 20).is_none(), "not a Markdown file");
     }
 
     fn rendered(lines: &[&str]) -> Vec<String> {
         let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         let doc = Markdown::parse(&lines);
-        (0..lines.len()).map(|i| text(&doc.render(i, &lines[i], 10).unwrap())).collect()
+        (0..lines.len()).map(|i| doc.render(i, &lines[i], 10).unwrap().text()).collect()
     }
 
     #[test]
@@ -781,5 +865,34 @@ mod tests {
         assert_eq!(rendered(&["a | b | c", "--|--"])[0], "a | b | c", "cell counts differ");
         let fenced: Vec<String> = ["```", "a | b", "--|--", "```"].map(String::from).to_vec();
         assert!(Markdown::parse(&fenced).render(1, &fenced[1], 10).is_none(), "tables in code stay code");
+    }
+
+    #[test]
+    fn links_record_where_they_are_drawn() {
+        let mut out = Rendered::default();
+        render_inline("see [the *docs*](https://x.y \"Title\"), ![logo](<a.png>) and <https://a.b>", Style::default(), &mut out);
+        let text = out.text();
+        let found: Vec<(&str, &str)> = out.links.iter().map(|l| (&text[l.range.clone()], l.url.as_str())).collect();
+        assert_eq!(found, [("the docs", "https://x.y"), ("▣ logo", "a.png"), ("https://a.b", "https://a.b")]);
+
+        // In a table the cell padding shifts the link along.
+        let lines: Vec<String> = ["| a | b |", "|---|--:|", "| long text | [x](u) |"].map(String::from).to_vec();
+        let row = Markdown::parse(&lines).render(2, &lines[2], 40).unwrap();
+        let text = row.text();
+        assert_eq!(row.links.len(), 1);
+        assert_eq!(&text[row.links[0].range.clone()], "x");
+    }
+
+    #[test]
+    fn anchors_point_to_headings_like_on_github() {
+        let lines: Vec<String> = ["# Usage", "## Usage", "## What's `new`?", "```", "# Fake", "```", "### Ünïcode Title ###"]
+            .map(String::from)
+            .to_vec();
+        let doc = Markdown::parse(&lines);
+        assert_eq!(doc.anchor_line(&lines, "usage"), Some(0));
+        assert_eq!(doc.anchor_line(&lines, "usage-1"), Some(1), "a repeated heading gets a number");
+        assert_eq!(doc.anchor_line(&lines, "whats-new"), Some(2));
+        assert_eq!(doc.anchor_line(&lines, "Ünïcode-Title"), Some(6));
+        assert_eq!(doc.anchor_line(&lines, "fake"), None, "not a heading inside code");
     }
 }

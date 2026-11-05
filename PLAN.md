@@ -26,7 +26,8 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   - File view: `j`/`k` or arrows move, `g`/`G` top/bottom, `v` paint (select)
     lines, `c`/`Enter` comment the line(s), `f` comment the whole file,
     `b` open the file browser (in the open file's directory), `m` Markdown
-    rendered/source, `q` quit
+    rendered/source, `o` open a link on the line (a numbered choice when there
+    are several), `q` quit
   - Painting: move to extend, `c`/`Enter` comment the selection, `v`/`Esc` stop
   - File browser: `j`/`k` `g`/`G` move, `Enter` open file or directory,
     `l`/`→` enter directory, `h`/`←`/`Backspace` parent, `c` comment the
@@ -59,6 +60,13 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   change the font size, so heading levels differ in style: H1 is a full-width
   bar, H2 and H3 are followed by a heavy and a thin line, H4 is cyan, H5 plain
   bold and H6 dim
+- **Links** (rendered Markdown): hovering shows a tooltip with the target. A
+  click on a link on the cursor line opens it, like a second click opens a
+  browser entry, so a click elsewhere still just moves to the line. `o` opens
+  the cursor line's link. http(s) and mailto go to the system opener (`open`,
+  `xdg-open`, `rundll32`, without a shell); relative paths open in annotator,
+  `#anchor` jumps to the heading with that GitHub-style slug. Every other scheme
+  is refused, because `open file:///…/x.app` would start a program
 - **Scopes**: an annotation is about a line range (TUI painting or
   `<file> --lines A-B`), a whole file (TUI `f` / browser `c`, or `--path FILE`)
   or a whole directory (browser `c`/`C`, or `--path DIR`). A directory gets one
@@ -132,8 +140,11 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
 - `src/annotation.rs` — hashing, Markdown output (incl. the `Context` code block), git detection, file and
   directory annotations, `.gitignore`-aware directory hash.
 - `src/markdown.rs` — Markdown highlighting (headings, lists, inline markup, code fences) and
-  rendering (hidden markup, nesting, escapes, tables and their alignment, non-ASCII text).
-- `src/app.rs` — Rust highlighting (non-ASCII text), Markdown drawn rendered and as source (`m`), comment wrapping (`wrap_note`), key
+  rendering (hidden markup, nesting, escapes, tables and their alignment, non-ASCII text, link
+  positions, GitHub-style heading anchors).
+- `src/app.rs` — Rust highlighting (non-ASCII text), Markdown drawn rendered and as source (`m`),
+  links (hover tooltip, click and `o` to open, the choice of several, refused schemes, relative
+  files and anchors), comment wrapping (`wrap_note`), key
   handling for every action (painting, mouse wheel/click/drag, line/file/directory comments, discard,
   empty comments, browser navigation and switching files, help screen) and
   rendering into ratatui's `TestBackend` (comment box wrap/grow/scroll and
@@ -191,6 +202,8 @@ annotation to a file named `<UUID>.md` containing the note plus metadata.
   ([#7](https://github.com/JooseRajamaeki/annotations/issues/7)). Rendering keeps one source
   line per rendered line so line annotations still match the file. The Markdown code moved to
   `src/markdown.rs`
+- 2026-11-05 — Heading levels look different (H1 bar, H2/H3 lines, H4-H6 fading). Links show a
+  tooltip on hover and open with a click on the cursor line or `o`
 
 ## Feedback from User Testing
 
