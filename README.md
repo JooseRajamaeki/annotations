@@ -39,8 +39,21 @@ The second line of the header always shows the main keys for what you are doing,
 | `v` | select (paint) lines |
 | `c` / `Enter` | comment on the selected line(s) |
 | `f` | comment on the whole file |
+| `m` | show a Markdown file rendered or as source |
+| `o` | open a link on the line (Markdown) |
 | `b` | browse files; `c` there comments on a file or directory |
 | `q` | quit |
+
+Markdown files open rendered: headings, emphasis, links, lists, quotes and
+tables are drawn without their markup. Each source line stays on its own line
+with its own number, so you select and comment on the file as written. Press `m`
+to see the source.
+
+Hover over a link to see where it goes. Click a link on the cursor line, or press
+`o`, to open it. Web and mail links open in your browser or mail app. Links to
+files and directories open in annotator, and `#heading` links jump to the
+heading. Other links, such as `file:` ones, are not opened, so a link cannot
+start a program.
 
 The mouse works too. Scroll with the wheel, click to move to a line, and drag to select lines. In the file browser, click to select an entry and click it again to open it. Because annotator captures the mouse, selecting text in the terminal needs your terminal's modifier key (usually Shift, or Option in iTerm2).
 
@@ -91,3 +104,7 @@ This could be a loop
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+---
+
+Edited by Claude Opus 5.5 a6ce3c44-4635-42c0-b6c3-48e952313d1c

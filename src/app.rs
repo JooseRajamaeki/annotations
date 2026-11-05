@@ -16,6 +16,7 @@ use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthChar;
 
 use crate::annotation::{read_text_file, save_annotation, save_path_annotation};
+use crate::markdown::{markdown_highlight, Link, Markdown, MdLine, CODE_INDENT};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -27,6 +28,8 @@ pub enum Mode {
     /// The name was left blank: asking whether to save without one.
     ConfirmNoName,
     FileBrowser,
+    /// `o` found several links on the line: choosing one by number.
+    PickLink,
 }
 
 impl Mode {
@@ -38,6 +41,7 @@ impl Mode {
             Mode::Naming => "YOUR NAME",
             Mode::ConfirmNoName => "NO NAME?",
             Mode::FileBrowser => "FILE BROWSER",
+            Mode::PickLink => "OPEN LINK",
         }
     }
 }
@@ -59,6 +63,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("v", "paint (select) lines"),
         ("c / Enter", "comment the line(s)"),
         ("f", "comment the whole file"),
+        ("m", "Markdown: rendered / source"),
         ("b", "browse files"),
         ("q", "quit"),
     ]),
@@ -93,6 +98,12 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("drag", "paint lines"),
         ("click again", "open the selected entry"),
     ]),
+    ("Links (rendered Markdown)", &[
+        ("o", "open a link on the cursor line"),
+        ("1-9 / Esc", "pick one of several links / cancel"),
+        ("hover", "show where a link goes"),
+        ("click", "open a link on the cursor line"),
+    ]),
 ];
 
 /// Lines (or browser entries) scrolled per mouse wheel step.
@@ -119,6 +130,36 @@ fn relative_to_cwd(path: &Path) -> PathBuf {
     }
 }
 
+/// Open a web or mail link with the system's default app. No shell is
+/// involved, so the URL cannot run commands.
+fn open_in_system(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(windows)]
+    let mut command = {
+        // `cmd /c start` would parse `&` in the URL as a command separator.
+        let mut c = Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut command = Command::new("xdg-open");
+    let mut child = command.arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    // Reap the opener when it exits so it does not linger as a zombie.
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
+/// The scheme of a URL (`https` in `https://x`), if it has one.
+fn url_scheme(url: &str) -> Option<&str> {
+    let (scheme, _) = url.split_once(':')?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(scheme)
+}
+
 /// Information about a file or directory entry
 #[derive(Clone)]
 struct FileInfo {
@@ -140,8 +181,11 @@ pub struct App {
     contents: String,
     lines: Vec<String>,
     syntax: Syntax,
-    /// Code block state of each line, for Markdown files (empty otherwise).
-    md_lines: Vec<MdLine>,
+    /// The kind of each line, for Markdown files (empty otherwise).
+    markdown: Markdown,
+    /// Whether Markdown files are shown rendered rather than as source.
+    /// Kept when another file is opened.
+    render_markdown: bool,
     output_dir: PathBuf,
     cursor: usize,
     /// Start of the painted selection (0-based). `None` = no painting active.
@@ -176,6 +220,14 @@ pub struct App {
     row_lines: Vec<usize>,
     /// Line (0-based) the left mouse button was pressed on, while it is held.
     drag_from: Option<usize>,
+    /// Last mouse position (column, row), for the link tooltip.
+    mouse_at: Option<(u16, u16)>,
+    /// Link pressed on the cursor line; opened if the button is released on it.
+    pressed_link: Option<String>,
+    /// Links offered by `o` when the cursor line has several.
+    link_choices: Vec<String>,
+    /// Opens a web or mail link outside annotator. Replaced in tests.
+    open_url: fn(&str) -> std::io::Result<()>,
 }
 
 /// Colorize a line of Rust code with basic syntax highlighting
@@ -307,203 +359,6 @@ impl Syntax {
         } else {
             Syntax::Rust
         }
-    }
-}
-
-/// Where a Markdown line sits relative to fenced code blocks.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MdLine {
-    Text,
-    /// An opening or closing ``` / ~~~ fence.
-    Fence,
-    /// Inside a fenced code block; `rust` when the block is tagged rs/rust.
-    Code { rust: bool },
-}
-
-/// A code fence: up to 3 spaces, then 3 or more backticks or tildes.
-/// Returns the fence char, the fence length and the info string after it.
-fn code_fence(line: &str) -> Option<(char, usize, &str)> {
-    let rest = line.trim_start_matches(' ');
-    if line.len() - rest.len() > 3 {
-        return None;
-    }
-    let c = rest.chars().next().filter(|&c| c == '`' || c == '~')?;
-    let len = rest.len() - rest.trim_start_matches(c).len();
-    let info = rest[len..].trim();
-    if len < 3 || (c == '`' && info.contains('`')) {
-        return None;
-    }
-    Some((c, len, info))
-}
-
-/// Classify every line of a Markdown file. A block is closed by a fence of the
-/// same char that is at least as long as the opening one and has no info string.
-fn markdown_lines(lines: &[String]) -> Vec<MdLine> {
-    let mut open: Option<(char, usize, bool)> = None;
-    lines
-        .iter()
-        .map(|line| match (open, code_fence(line)) {
-            (None, Some((c, len, info))) => {
-                let lang = info.split_whitespace().next().unwrap_or("");
-                open = Some((c, len, lang == "rs" || lang == "rust"));
-                MdLine::Fence
-            }
-            (Some((c, len, _)), Some((fc, flen, ""))) if fc == c && flen >= len => {
-                open = None;
-                MdLine::Fence
-            }
-            (Some((_, _, rust)), _) => MdLine::Code { rust },
-            (None, None) => MdLine::Text,
-        })
-        .collect()
-}
-
-/// Colorize a line of Markdown text (not inside a code block): headings, rules,
-/// quote and list markers, then inline code, links, bold and italic.
-fn markdown_highlight(line: &str) -> Vec<Span<'_>> {
-    let marker = Style::default().fg(Color::Magenta);
-    let dim = Style::default().fg(Color::DarkGray);
-    let trimmed = line.trim_start();
-    let hashes = trimmed.len() - trimmed.trim_start_matches('#').len();
-    if (1..=6).contains(&hashes) && (trimmed.len() == hashes || trimmed[hashes..].starts_with(' ')) {
-        return vec![Span::styled(line, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))];
-    }
-    let compact: String = trimmed.chars().filter(|c| *c != ' ').collect();
-    if compact.len() >= 3 && ['-', '*', '_'].iter().any(|&c| compact.trim_start_matches(c).is_empty()) {
-        return vec![Span::styled(line, dim)];
-    }
-
-    let mut spans = Vec::new();
-    // Indentation, then any `>` quote markers, then a list marker.
-    let mut pos = line.len() - trimmed.len();
-    if pos > 0 {
-        spans.push(Span::raw(&line[..pos]));
-    }
-    while line[pos..].starts_with('>') {
-        let end = if line[pos + 1..].starts_with(' ') { pos + 2 } else { pos + 1 };
-        spans.push(Span::styled(&line[pos..end], dim));
-        pos = end;
-    }
-    let rest = &line[pos..];
-    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let list_marker = if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
-        Some(2)
-    } else if (1..=9).contains(&digits) && (rest[digits..].starts_with(". ") || rest[digits..].starts_with(") ")) {
-        Some(digits + 2)
-    } else {
-        None
-    };
-    if let Some(len) = list_marker {
-        spans.push(Span::styled(&line[pos..pos + len], marker));
-        pos += len;
-    }
-    markdown_inline(line, pos, &mut spans);
-    if spans.is_empty() {
-        spans.push(Span::raw(line));
-    }
-    spans
-}
-
-/// End (exclusive) of an emphasis run that `delim` opens at byte `start`, or
-/// `None` if it does not open one. Like CommonMark, the text must not start or
-/// end with a space, and `_` does not work inside words (`snake_case`).
-fn emphasis_end(line: &str, start: usize, delim: &str) -> Option<usize> {
-    let inner = start + delim.len();
-    let underscore = delim.starts_with('_');
-    let before = line[..start].chars().next_back();
-    if line[inner..].starts_with([' ', '\t']) || (underscore && before.is_some_and(char::is_alphanumeric)) {
-        return None;
-    }
-    // A single `*` or `_` must not close on half of a `**` or `__`.
-    let single = (delim.len() == 1).then(|| delim.chars().next().unwrap_or('*'));
-    let mut from = inner;
-    while let Some(i) = line[from..].find(delim) {
-        let close = from + i;
-        let after = line[close + delim.len()..].chars().next();
-        let doubled = single.is_some_and(|c| after == Some(c) || line[..close].ends_with(c));
-        if close > inner
-            && !doubled
-            && !line[..close].ends_with([' ', '\t'])
-            && !(underscore && after.is_some_and(char::is_alphanumeric))
-        {
-            return Some(close + delim.len());
-        }
-        from = close + 1;
-    }
-    None
-}
-
-/// Inline Markdown from byte `pos` of `line` to its end, appended to `spans`.
-fn markdown_inline<'a>(line: &'a str, mut pos: usize, spans: &mut Vec<Span<'a>>) {
-    let code = Style::default().fg(Color::Yellow);
-    let link = Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
-    let dim = Style::default().fg(Color::DarkGray);
-    let bytes = line.as_bytes();
-    // Start of the plain text not yet pushed.
-    let mut plain = pos;
-    while pos < line.len() {
-        // Every marker is ASCII, so `pos` is a char boundary whenever it matches.
-        let styled: Option<(usize, Vec<(usize, Style)>)> = match bytes[pos] {
-            b'\\' => {
-                pos += 2;
-                continue;
-            }
-            b'`' => {
-                let run = line[pos..].len() - line[pos..].trim_start_matches('`').len();
-                let fence = &line[pos..pos + run];
-                // Closing run of exactly the same length.
-                let mut close = None;
-                let mut from = pos + run;
-                while let Some(i) = line[from..].find(fence) {
-                    let at = from + i;
-                    let len = line[at..].len() - line[at..].trim_start_matches('`').len();
-                    if len == run {
-                        close = Some(at + run);
-                        break;
-                    }
-                    from = at + len;
-                }
-                match close {
-                    Some(end) => Some((end, vec![(end, code)])),
-                    None => {
-                        pos += run;
-                        continue;
-                    }
-                }
-            }
-            b'[' | b'!' if line[pos..].starts_with('[') || line[pos..].starts_with("![") => {
-                let text_start = pos + line[pos..].find('[').unwrap_or(0);
-                line[text_start..].find("](").and_then(|close| {
-                    let url_start = text_start + close + 1;
-                    let end = url_start + line[url_start..].find(')')? + 1;
-                    Some((end, vec![(url_start, link), (end, dim)]))
-                })
-            }
-            b'*' | b'_' => {
-                let delim = if bytes.get(pos + 1) == Some(&bytes[pos]) { &line[pos..pos + 2] } else { &line[pos..pos + 1] };
-                let modifier = if delim.len() == 2 { Modifier::BOLD } else { Modifier::ITALIC };
-                emphasis_end(line, pos, delim).map(|end| (end, vec![(end, Style::default().add_modifier(modifier))]))
-            }
-            _ => None,
-        };
-        match styled {
-            Some((end, parts)) => {
-                if plain < pos {
-                    spans.push(Span::raw(&line[plain..pos]));
-                }
-                let mut from = pos;
-                for (to, style) in parts {
-                    spans.push(Span::styled(&line[from..to], style));
-                    from = to;
-                }
-                pos = end;
-                plain = end;
-            }
-            None => pos += 1,
-        }
-    }
-    if plain < line.len() {
-        spans.push(Span::raw(&line[plain..]));
     }
 }
 
@@ -670,7 +525,8 @@ impl App {
             contents: String::new(),
             lines: vec![String::new()],
             syntax: Syntax::Rust,
-            md_lines: Vec::new(),
+            markdown: Markdown::default(),
+            render_markdown: true,
             output_dir: output_dir.to_path_buf(),
             cursor: 0,
             anchor: None,
@@ -693,6 +549,10 @@ impl App {
             body_area: Rect::default(),
             row_lines: Vec::new(),
             drag_from: None,
+            mouse_at: None,
+            pressed_link: None,
+            link_choices: Vec::new(),
+            open_url: open_in_system,
         }
     }
 
@@ -721,9 +581,9 @@ impl App {
             self.lines = vec![String::new()];
         }
         self.syntax = Syntax::for_path(path);
-        self.md_lines = match self.syntax {
-            Syntax::Markdown => markdown_lines(&self.lines),
-            Syntax::Rust => Vec::new(),
+        self.markdown = match self.syntax {
+            Syntax::Markdown => Markdown::parse(&self.lines),
+            Syntax::Rust => Markdown::default(),
         };
         self.contents = contents;
         self.mode = Mode::Normal;
@@ -839,7 +699,7 @@ impl App {
 
     /// Screen rows line `idx` takes when wrapped.
     fn line_rows(&self, idx: usize) -> usize {
-        wrap_starts(&self.lines[idx], self.text_width()).len()
+        self.display(idx, self.text_width()).1.len()
     }
 
     /// The first line of a view that ends with line `last` and fits in
@@ -885,7 +745,7 @@ impl App {
     /// Line `idx` of the open file, colored for its syntax.
     fn highlight(&self, idx: usize) -> Vec<Span<'_>> {
         let line = &self.lines[idx];
-        match (self.syntax, self.md_lines.get(idx)) {
+        match (self.syntax, self.markdown.kind(idx)) {
             (Syntax::Markdown, Some(MdLine::Text)) => markdown_highlight(line),
             (Syntax::Markdown, Some(MdLine::Fence)) => vec![Span::styled(line.as_str(), Style::default().fg(Color::DarkGray))],
             (Syntax::Markdown, Some(MdLine::Code { rust: false })) => {
@@ -893,6 +753,142 @@ impl App {
             }
             _ => syntax_highlight(line),
         }
+    }
+
+    fn toggle_markdown(&mut self) {
+        if self.syntax == Syntax::Markdown {
+            self.render_markdown = !self.render_markdown;
+            let shown = if self.render_markdown { "rendered" } else { "source" };
+            self.status = format!("showing Markdown {shown} — m to switch");
+        }
+    }
+
+    /// Links on line `idx` of a Markdown file, as rendered `width` wide.
+    fn links(&self, idx: usize, width: usize) -> Vec<Link> {
+        self.markdown.render(idx, &self.lines[idx], width).map_or(Vec::new(), |r| r.links)
+    }
+
+    /// `o`: open the link on the cursor line, or offer a choice when there are several.
+    fn open_cursor_links(&mut self) {
+        let mut urls: Vec<String> = self.links(self.cursor, self.text_width()).into_iter().map(|l| l.url).collect();
+        urls.dedup();
+        match urls.len() {
+            0 => self.status = "no link on this line".to_string(),
+            1 => self.open_link(&urls[0]),
+            _ => {
+                urls.truncate(9);
+                self.link_choices = urls;
+                self.mode = Mode::PickLink;
+            }
+        }
+    }
+
+    /// Follow a link: web and mail links open outside annotator, `#heading`
+    /// jumps within the file, and relative paths open in annotator. Other
+    /// schemes (`file:`, `javascript:`, ...) are refused, because the system
+    /// opener would also run programs.
+    fn open_link(&mut self, url: &str) {
+        match url_scheme(url) {
+            Some(s) if ["http", "https", "mailto"].iter().any(|w| s.eq_ignore_ascii_case(w)) => {
+                self.status = match (self.open_url)(url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(e) => format!("cannot open {url}: {e}"),
+                };
+            }
+            Some(_) => self.status = format!("not opened: only http, https and mailto links open ({url})"),
+            None => {
+                let (path, anchor) = url.split_once('#').map_or((url, None), |(p, a)| (p, Some(a)));
+                if !path.is_empty() && !self.open_link_path(path) {
+                    return;
+                }
+                if let Some(anchor) = anchor.filter(|a| !a.is_empty()) {
+                    match self.markdown.anchor_line(&self.lines, anchor) {
+                        Some(line) => {
+                            self.cursor = line;
+                            self.anchor = None;
+                            self.status = format!("#{anchor}");
+                        }
+                        None => self.status = format!("no heading #{anchor}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open the file or directory a relative link points to; `false` if it cannot be opened.
+    fn open_link_path(&mut self, path: &str) -> bool {
+        let base = self.file.as_deref().and_then(Path::parent).unwrap_or(Path::new(""));
+        let target = base.join(path);
+        if target.is_dir() {
+            let dir = std::path::absolute(&target).unwrap_or(target);
+            self.browse(dir, None);
+            self.status = String::new();
+            return true;
+        }
+        match read_text_file(&target) {
+            Ok(contents) => {
+                if let Some(dir) = std::path::absolute(&target).ok().and_then(|t| t.parent().map(Path::to_path_buf)) {
+                    self.browser_path = dir;
+                }
+                self.load_file(&target, contents);
+                self.status = format!("opened {}", target.display());
+                true
+            }
+            Err(e) => {
+                self.status = format!("cannot open {path}: {e}");
+                false
+            }
+        }
+    }
+
+    /// The line and link under the screen cell (`col`, `row`), when the file
+    /// is shown rendered.
+    fn link_at_cell(&self, col: u16, row: u16) -> Option<(usize, String)> {
+        if !self.rendering() || row < self.body_area.y {
+            return None;
+        }
+        let offset = (row - self.body_area.y) as usize;
+        let idx = *self.row_lines.get(offset)?;
+        let first = self.row_lines.iter().position(|&l| l == idx)?;
+        let width = self.text_width();
+        let rendered = self.markdown.render(idx, &self.lines[idx], width)?;
+        let text = rendered.text();
+        let starts = wrap_starts(&text, width);
+        let from = *starts.get(offset - first)?;
+        let to = starts.get(offset - first + 1).copied().unwrap_or(text.len());
+        let x = (col as usize).checked_sub(self.body_area.x as usize + self.gutter_digits() + 2)?;
+        let mut used = 0;
+        let byte = text[from..to].char_indices().find_map(|(i, c)| {
+            used += char_width(c);
+            (used > x).then_some(from + i)
+        })?;
+        let link = rendered.links.into_iter().find(|l| l.range.contains(&byte))?;
+        Some((idx, link.url))
+    }
+
+    /// Whether the open file is Markdown shown rendered.
+    fn rendering(&self) -> bool {
+        self.syntax == Syntax::Markdown && self.render_markdown
+    }
+
+    /// Line `idx` as drawn, `width` columns wide: its spans and the byte
+    /// offsets (into the spans' joined text) where its screen rows start.
+    fn display(&self, idx: usize, width: usize) -> (Vec<Span<'_>>, Vec<usize>) {
+        if !self.rendering() {
+            return (self.highlight(idx), wrap_starts(&self.lines[idx], width));
+        }
+        let spans = match self.markdown.render(idx, &self.lines[idx], width) {
+            Some(rendered) => rendered.spans,
+            None => {
+                // Code block lines keep their source colors.
+                let mut spans = vec![Span::raw(CODE_INDENT)];
+                spans.extend(self.highlight(idx));
+                spans
+            }
+        };
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let starts = wrap_starts(&text, width);
+        (spans, starts)
     }
 
     /// Whether a comment is being written or saved (the editor or the name prompt).
@@ -1014,6 +1010,8 @@ impl App {
                         self.start_editing(CommentTarget::Path(file));
                     }
                 }
+                KeyCode::Char('m') => self.toggle_markdown(),
+                KeyCode::Char('o') => self.open_cursor_links(),
                 KeyCode::Char('b') => self.open_browser(),
                 _ => {}
             },
@@ -1051,6 +1049,20 @@ impl App {
                     self.save();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Naming,
+                _ => {}
+            },
+            Mode::PickLink => match key.code {
+                KeyCode::Char(c @ '1'..='9') => {
+                    let pick = self.link_choices.get(c as usize - '1' as usize).cloned();
+                    if let Some(url) = pick {
+                        self.mode = Mode::Normal;
+                        self.open_link(&url);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = Mode::Normal;
+                    self.status.clear();
+                }
                 _ => {}
             },
             Mode::FileBrowser => match key.code {
@@ -1112,12 +1124,19 @@ impl App {
         }
         let visible = self.body_area.height as usize;
         let in_body = self.body_area.contains(Position::new(mouse.column, mouse.row));
+        self.mouse_at = Some((mouse.column, mouse.row));
         match self.mode {
             Mode::Normal | Mode::Visual => match mouse.kind {
                 MouseEventKind::ScrollDown => self.scroll_file(WHEEL_STEP),
                 MouseEventKind::ScrollUp => self.scroll_file(-WHEEL_STEP),
                 // A click moves to the line and stops painting; dragging from it paints.
                 MouseEventKind::Down(MouseButton::Left) if in_body => {
+                    // Like browser entries, a link opens when its line is already
+                    // selected, so a click can still just move to a line.
+                    self.pressed_link = self
+                        .link_at_cell(mouse.column, mouse.row)
+                        .filter(|(line, _)| *line == self.cursor && self.mode == Mode::Normal)
+                        .map(|(_, url)| url);
                     let line = self.line_at_row(mouse.row);
                     if line < self.lines.len() as isize {
                         self.anchor = None;
@@ -1127,6 +1146,11 @@ impl App {
                     }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
+                    let on_pressed = self.link_at_cell(mouse.column, mouse.row).map(|(_, url)| url);
+                    if self.pressed_link.is_some() && self.pressed_link == on_pressed {
+                        return;
+                    }
+                    self.pressed_link = None;
                     if let Some(from) = self.drag_from {
                         // Dragging above or below the body moves past the edge,
                         // and the view scrolls to follow.
@@ -1136,7 +1160,12 @@ impl App {
                         self.mode = Mode::Visual;
                     }
                 }
-                MouseEventKind::Up(MouseButton::Left) => self.drag_from = None,
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.drag_from = None;
+                    if let Some(url) = self.pressed_link.take() {
+                        self.open_link(&url);
+                    }
+                }
                 _ => {}
             },
             Mode::FileBrowser => match mouse.kind {
@@ -1168,7 +1197,7 @@ impl App {
                 _ => {}
             },
             // The comment is about the painted lines, so they stay put while writing.
-            Mode::Editing | Mode::Naming | Mode::ConfirmNoName => {}
+            Mode::Editing | Mode::Naming | Mode::ConfirmNoName | Mode::PickLink => {}
         }
     }
 
@@ -1176,11 +1205,17 @@ impl App {
     /// Kept within 80 columns; `?` lists everything.
     fn key_hints(&self) -> String {
         match self.mode {
+            // Markdown files need room for `m`, so their hints are shorter.
+            Mode::Normal if self.syntax == Syntax::Markdown => {
+                let other = if self.render_markdown { "source" } else { "render" };
+                format!("? help · v paint · c comment · f comment file · m {other} · b browse · q quit")
+            }
             Mode::Normal => "? help · v paint lines · c comment line(s) · f comment file · b browse · q quit".to_string(),
             Mode::Visual => "? help · j/k extend · c comment selection · v/Esc stop painting".to_string(),
             Mode::Editing => "Esc save · Ctrl+Q discard · Enter new line · ←/→ move cursor".to_string(),
             Mode::Naming => "Enter save with this name (may be blank) · Esc back to the comment".to_string(),
             Mode::ConfirmNoName => "y save without a name · n type a name".to_string(),
+            Mode::PickLink => "1-9 open that link · Esc cancel".to_string(),
             Mode::FileBrowser => {
                 let back = if self.file.is_some() { " · Esc back" } else { "" };
                 format!("? help · Enter open · h up · c comment entry · C comment dir{back} · q quit")
@@ -1243,8 +1278,13 @@ fn render(frame: &mut Frame, app: &mut App) {
     let title = if app.browsing() {
         format!(" Browse: {} ", app.browser_path.display())
     } else {
+        let view = match (app.syntax, app.render_markdown) {
+            (Syntax::Markdown, true) => " (rendered)",
+            (Syntax::Markdown, false) => " (source)",
+            _ => "",
+        };
         format!(
-            " {}  {} lines ",
+            " {}  {} lines{view} ",
             app.file.as_ref().map_or("No file".to_string(), |f| f.display().to_string()),
             app.lines.len()
         )
@@ -1299,6 +1339,12 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
     if naming {
         render_name_prompt(frame, app, chunks[3]);
+    }
+    if matches!(app.mode, Mode::Normal | Mode::Visual) && !app.show_help {
+        render_link_tooltip(frame, app);
+    }
+    if app.mode == Mode::PickLink {
+        render_link_choices(frame, app, body_area);
     }
 
     if app.show_help {
@@ -1377,7 +1423,8 @@ fn render_file(frame: &mut Frame, app: &mut App, body_area: Rect) {
         };
         let marker = if selected { ">" } else { " " };
 
-        let rows = split_rows(app.highlight(idx), &wrap_starts(&app.lines[idx], width));
+        let (spans, starts) = app.display(idx, width);
+        let rows = split_rows(spans, &starts);
         for (r, row) in rows.into_iter().enumerate().take(visible - body_lines.len()) {
             let number = if r == 0 { lineno.to_string() } else { WRAP_MARK.to_string() };
             let mut spans = vec![Span::styled(format!("{marker}{number:>gutter$} "), Style::default().fg(Color::DarkGray))];
@@ -1418,6 +1465,44 @@ fn render_name_prompt(frame: &mut Frame, app: &App, area: Rect) {
     let title = "Your name, saved with each annotation — Enter save · Esc back";
     frame.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), area);
     frame.set_cursor_position((area.x + 1 + (app.name_cursor - skip) as u16, area.y + 1));
+}
+
+/// Where the link under the mouse goes, on the row below it (above it at the
+/// bottom of the file view).
+fn render_link_tooltip(frame: &mut Frame, app: &App) {
+    let Some((col, row)) = app.mouse_at else { return };
+    let Some((line, url)) = app.link_at_cell(col, row) else { return };
+    let how = if line == app.cursor && app.mode == Mode::Normal { "click or o to open" } else { "click twice to open" };
+    let text = format!(" {url} · {how} ");
+    let area = frame.area();
+    let width = (Span::raw(text.as_str()).width() as u16).min(area.width);
+    let below = row + 1 < app.body_area.bottom();
+    let y = if below { row + 1 } else { row.saturating_sub(1) };
+    let x = col.min(area.right().saturating_sub(width));
+    let tip = Rect { x, y, width, height: 1 };
+    frame.render_widget(Clear, tip);
+    frame.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Gray)), tip);
+}
+
+/// The links `o` found on the cursor line, numbered for picking one.
+fn render_link_choices(frame: &mut Frame, app: &App, body_area: Rect) {
+    let lines: Vec<Line> = app
+        .link_choices
+        .iter()
+        .enumerate()
+        .map(|(i, url)| Line::from(vec![Span::styled(format!(" {} ", i + 1), Style::default().fg(Color::Yellow)), Span::raw(url.as_str())]))
+        .collect();
+    let longest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (longest + 3).max(30).min(body_area.width);
+    let height = (lines.len() as u16 + 2).min(body_area.height);
+    let popup = Rect {
+        x: body_area.x + (body_area.width - width) / 2,
+        y: body_area.y + (body_area.height - height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(lines).block(Block::bordered().title("Open which link? 1-9 · Esc cancel")), popup);
 }
 
 /// Centered popup listing every key (`?`).
@@ -1528,87 +1613,11 @@ mod tests {
         }
     }
 
-    /// The style of the span whose text is exactly `text`.
-    fn style_of(spans: &[Span], text: &str) -> Style {
-        spans
-            .iter()
-            .find(|s| s.content == text)
-            .unwrap_or_else(|| panic!("no span {text:?} in {spans:?}"))
-            .style
-    }
-
     #[test]
-    fn markdown_headings_rules_quotes_and_lists() {
-        let heading = markdown_highlight("## Usage");
-        assert_eq!(heading.len(), 1);
-        assert_eq!(heading[0].style.fg, Some(Color::Cyan));
-        assert!(heading[0].style.add_modifier.contains(Modifier::BOLD));
-        assert_eq!(markdown_highlight("#hashtag")[0].style.fg, None, "needs a space after #");
-        assert_eq!(markdown_highlight("---")[0].style.fg, Some(Color::DarkGray));
-        assert_eq!(markdown_highlight("* * *")[0].style.fg, Some(Color::DarkGray));
-
-        let item = markdown_highlight("  - item");
-        assert_eq!(style_of(&item, "- ").fg, Some(Color::Magenta));
-        let numbered = markdown_highlight("12. item");
-        assert_eq!(style_of(&numbered, "12. ").fg, Some(Color::Magenta));
-        let quote = markdown_highlight("> > - quoted item");
-        assert_eq!(style_of(&quote, "> ").fg, Some(Color::DarkGray));
-        assert_eq!(style_of(&quote, "- ").fg, Some(Color::Magenta));
-        assert_eq!(markdown_highlight("-not a list")[0].style.fg, None);
-    }
-
-    #[test]
-    fn markdown_inline_code_links_and_emphasis() {
-        let spans = markdown_highlight("use `a*b*c` or ``x ` y`` and **bold** and *it* or _it_");
-        assert_eq!(style_of(&spans, "`a*b*c`").fg, Some(Color::Yellow), "no emphasis inside code");
-        assert_eq!(style_of(&spans, "``x ` y``").fg, Some(Color::Yellow));
-        assert!(style_of(&spans, "**bold**").add_modifier.contains(Modifier::BOLD));
-        assert!(style_of(&spans, "*it*").add_modifier.contains(Modifier::ITALIC));
-        assert!(style_of(&spans, "_it_").add_modifier.contains(Modifier::ITALIC));
-
-        let link = markdown_highlight("see [the docs](https://x.y) and ![logo](a.png)");
-        assert_eq!(style_of(&link, "[the docs]").fg, Some(Color::Blue));
-        assert_eq!(style_of(&link, "(https://x.y)").fg, Some(Color::DarkGray));
-        assert_eq!(style_of(&link, "![logo]").fg, Some(Color::Blue));
-
-        // Not emphasis: snake_case, spaced-out stars, escapes, unclosed markers.
-        for line in ["call snake_case_name here", "2 * 3 * 4", "\\*not italic\\*", "*open", "`open", "[a](b"] {
-            let spans = markdown_highlight(line);
-            assert!(spans.iter().all(|s| s.style == Style::default()), "{line}: {spans:?}");
-        }
-        let nested = markdown_highlight("*a **b** c*");
-        assert!(style_of(&nested, "*a **b** c*").add_modifier.contains(Modifier::ITALIC));
-    }
-
-    #[test]
-    fn markdown_code_fences() {
-        let lines: Vec<String> = [
-            "````markdown", "```rs", "fn a() {}", "```", "````", // a 3-tick fence inside a 4-tick block
-            "~~~ rust", "let x = 1;", "```", "~~~",              // ``` does not close ~~~
-            "```", "# not a heading", "``` trailing", "```",     // a closing fence has no info string
-            "text", "    ```", "text",                           // indented 4: not a fence
-        ]
-        .map(String::from)
-        .to_vec();
-        use MdLine::*;
-        let rust = Code { rust: true };
-        let other = Code { rust: false };
-        assert_eq!(
-            markdown_lines(&lines),
-            [
-                Fence, other, other, other, Fence,
-                Fence, rust, rust, Fence,
-                Fence, other, other, Fence,
-                Text, Text, Text,
-            ]
-        );
-        assert_eq!(markdown_lines(&["```".to_string(), "unclosed".to_string()]), [Fence, other]);
-    }
-
-    #[test]
-    fn markdown_files_are_drawn_with_markdown_colors() {
+    fn markdown_source_is_drawn_with_markdown_colors() {
         let text = "# Title\nfn is a word here\n```rs\nfn main() {}\n```\n";
         let mut app = App::new(Path::new("notes.MD"), text, Path::new("out"));
+        press(&mut app, KeyCode::Char('m'));
         app.cursor = 4; // keep the cursor's bold off the lines under test
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -1622,7 +1631,7 @@ mod tests {
 
         let rust = App::new(Path::new("main.rs"), text, Path::new("out"));
         assert_eq!(rust.syntax, Syntax::Rust);
-        assert!(rust.md_lines.is_empty());
+        assert!(rust.markdown.kind(0).is_none());
     }
 
     fn chars(s: &str) -> Vec<char> {
@@ -1719,6 +1728,80 @@ mod tests {
         press(&mut app, KeyCode::Char('v'));
         let (rows, _) = draw(&mut app, 20, 8);
         assert!(rows[2].starts_with(">  1") && rows[3].starts_with(">  ↪"), "{rows:#?}");
+    }
+
+    #[test]
+    fn markdown_is_rendered_in_place_and_m_shows_the_source() {
+        let text = "# Title\n\nSome **bold** text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n```rs\nfn main() {}\n```\n";
+        let mut app = App::new(Path::new("x.md"), text, Path::new("out"));
+        let (rows, _) = draw(&mut app, 80, 14);
+        assert!(rows[0].contains("x.md  10 lines (rendered)"), "{}", rows[0]);
+        assert!(rows[1].contains("m source"), "{}", rows[1]);
+        let body: Vec<&str> = rows[2..12].iter().map(|r| r.trim_end()).collect();
+        assert_eq!(
+            body,
+            [
+                "   1  Title",
+                "   2",
+                "   3 Some bold text",
+                "   4",
+                "   5 a │ b",
+                "   6 ──┼──",
+                "   7 1 │ 2",
+                "   8   rs",
+                "   9   fn main() {}",
+                "  10",
+            ]
+        );
+
+        press(&mut app, KeyCode::Char('m'));
+        let (rows, _) = draw(&mut app, 80, 14);
+        assert!(rows[0].contains("(source)"), "{}", rows[0]);
+        assert!(rows[1].contains("m render"), "{}", rows[1]);
+        assert_eq!(rows[2].trim_end(), "   1 # Title");
+        assert_eq!(rows[6].trim_end(), "   5 | a | b |");
+        assert!(app.status.contains("source"), "{}", app.status);
+
+        // The choice holds for the next Markdown file; other files ignore `m`.
+        app.load_file(Path::new("y.md"), "**y**\n".to_string());
+        assert_eq!(draw(&mut app, 80, 14).0[2].trim_end(), "   1 **y**");
+        app.load_file(Path::new("z.rs"), "fn z() {}\n".to_string());
+        press(&mut app, KeyCode::Char('m'));
+        assert!(!app.render_markdown);
+        let (rows, _) = draw(&mut app, 80, 14);
+        assert!(!rows[0].contains("(source)") && !rows[1].contains("m render"), "{rows:#?}");
+    }
+
+    #[test]
+    fn painting_rendered_markdown_saves_the_source_lines() {
+        let dir = temp_dir();
+        let text = "# Title\n- **one**\n";
+        let mut app = App::new(&dir.join("x.md"), text, &dir.join("out"));
+        app.user = Some("me".to_string());
+        draw(&mut app, 40, 10);
+        press(&mut app, KeyCode::Char('v'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('c'));
+        type_text(&mut app, "note");
+        press(&mut app, KeyCode::Esc);
+        let saved = fs::read_to_string(&saved_files(&dir.join("out"))[0]).unwrap();
+        assert!(saved.contains("x.md#L1-2`"), "{saved}");
+        assert!(saved.contains("# Title\n- **one**\n"), "{saved}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rows_of_wrapped_rendered_lines_map_back_to_their_line() {
+        // Rendered, the link is short and fits; as source it wraps.
+        let text = "[a](https://example.com/a/long/address)\nnext\n";
+        let mut app = App::new(Path::new("x.md"), text, Path::new("out"));
+        draw(&mut app, 25, 8);
+        assert_eq!(app.row_lines, [0, 1]);
+        press(&mut app, KeyCode::Char('m'));
+        draw(&mut app, 25, 8);
+        assert_eq!(app.row_lines, [0, 0, 1]);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 4);
+        assert_eq!(app.cursor, 1, "the row under the click is line 2");
     }
 
     #[test]
@@ -1928,11 +2011,16 @@ mod tests {
 
     #[test]
     fn key_hints_fit_in_80_columns() {
-        let mut app = App::new(Path::new("x.rs"), "a\n", Path::new("out"));
-        for mode in [Mode::Normal, Mode::Visual, Mode::Editing, Mode::Naming, Mode::ConfirmNoName, Mode::FileBrowser] {
-            app.mode = mode;
-            let width = app.key_hints().chars().count();
-            assert!(width <= 80, "{mode:?} hints are {width} columns");
+        for file in ["x.rs", "x.md"] {
+            let mut app = App::new(Path::new(file), "a\n", Path::new("out"));
+            for render_markdown in [true, false] {
+                app.render_markdown = render_markdown;
+                for mode in [Mode::Normal, Mode::Visual, Mode::Editing, Mode::Naming, Mode::ConfirmNoName, Mode::FileBrowser] {
+                    app.mode = mode;
+                    let width = app.key_hints().chars().count();
+                    assert!(width <= 80, "{file} {mode:?} hints are {width} columns");
+                }
+            }
         }
     }
 
@@ -2441,5 +2529,160 @@ mod tests {
         mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 5);
         assert!(!app.show_help);
         assert_eq!(app.cursor, 0, "the click that closes help is not acted on");
+    }
+
+    // --- Links in rendered Markdown. ---
+
+    thread_local! {
+        static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn record_open(url: &str) -> std::io::Result<()> {
+        OPENED.with(|o| o.borrow_mut().push(url.to_string()));
+        Ok(())
+    }
+
+    fn opened() -> Vec<String> {
+        OPENED.with(|o| o.borrow_mut().drain(..).collect())
+    }
+
+    /// An app on `text` that records links instead of opening them.
+    fn link_app(path: &Path, text: &str) -> App {
+        let mut app = App::new(path, text, Path::new("out"));
+        app.open_url = record_open;
+        opened();
+        app
+    }
+
+    fn mouse_at(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+        app.handle_mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        mouse_at(app, MouseEventKind::Down(MouseButton::Left), column, row);
+        mouse_at(app, MouseEventKind::Up(MouseButton::Left), column, row);
+    }
+
+    #[test]
+    fn url_schemes() {
+        assert_eq!(url_scheme("https://x.y"), Some("https"));
+        assert_eq!(url_scheme("mailto:a@b.c"), Some("mailto"));
+        assert_eq!(url_scheme("docs/a.md"), None);
+        assert_eq!(url_scheme("docs/a:b.md"), None);
+        assert_eq!(url_scheme("#usage"), None);
+    }
+
+    #[test]
+    fn hovering_a_link_shows_where_it_goes() {
+        let mut app = link_app(Path::new("x.md"), "go [docs](https://x.y) now\nnext\n");
+        draw(&mut app, 60, 10);
+        // The text starts at column 5; "docs" is at columns 8-11 of row 2.
+        mouse_at(&mut app, MouseEventKind::Moved, 9, 2);
+        let (rows, _) = draw(&mut app, 60, 10);
+        assert!(rows[3].contains("https://x.y · click or o to open"), "{rows:#?}");
+        mouse_at(&mut app, MouseEventKind::Moved, 6, 2);
+        assert!(!draw(&mut app, 60, 10).0.join("\n").contains("https://x.y"), "only over the link");
+
+        // Off the cursor line the first click only moves the cursor.
+        let mut app = link_app(Path::new("x.md"), "top\n[docs](https://x.y)\n");
+        draw(&mut app, 60, 10);
+        mouse_at(&mut app, MouseEventKind::Moved, 6, 3);
+        assert!(draw(&mut app, 60, 10).0[4].contains("click twice to open"));
+        // In the source view there is no tooltip.
+        press(&mut app, KeyCode::Char('m'));
+        assert!(!draw(&mut app, 60, 10).0.join("\n").contains("click"));
+    }
+
+    #[test]
+    fn clicking_a_link_on_the_cursor_line_opens_it() {
+        let mut app = link_app(Path::new("x.md"), "[a](https://a.b)\n[c](https://c.d)\nthird\n");
+        draw(&mut app, 60, 10);
+        click(&mut app, 5, 2);
+        assert_eq!(opened(), ["https://a.b"]);
+        assert_eq!(app.status, "opened https://a.b");
+
+        click(&mut app, 5, 3);
+        assert_eq!(app.cursor, 1);
+        assert!(opened().is_empty(), "the first click moves to the line");
+        click(&mut app, 5, 3);
+        assert_eq!(opened(), ["https://c.d"]);
+
+        // Dragging off the link paints lines instead.
+        mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), 5, 3);
+        mouse_at(&mut app, MouseEventKind::Drag(MouseButton::Left), 5, 4);
+        mouse_at(&mut app, MouseEventKind::Up(MouseButton::Left), 5, 4);
+        assert!(opened().is_empty());
+        assert_eq!(app.selection(), (2, 3));
+    }
+
+    #[test]
+    fn o_opens_the_link_or_offers_a_choice() {
+        let mut app = link_app(Path::new("x.md"), "[a](https://a.b)\n[b](https://b.c) and [c](mailto:c@d.e)\nnone\n");
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(opened(), ["https://a.b"]);
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.mode, Mode::PickLink);
+        let (rows, _) = draw(&mut app, 60, 12);
+        let screen = rows.join("\n");
+        assert!(screen.contains(" 1 https://b.c") && screen.contains(" 2 mailto:c@d.e"), "{screen}");
+        assert!(rows[1].contains("1-9 open that link"), "{}", rows[1]);
+        press(&mut app, KeyCode::Char('3'));
+        assert_eq!(app.mode, Mode::PickLink, "there is no third link");
+        press(&mut app, KeyCode::Char('2'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(opened(), ["mailto:c@d.e"]);
+
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(opened().is_empty());
+
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.status, "no link on this line");
+    }
+
+    #[test]
+    fn links_that_could_run_programs_are_refused() {
+        for url in ["file:///Applications/Calculator.app", "javascript:alert(1)", "ssh://host"] {
+            let mut app = link_app(Path::new("x.md"), &format!("[x]({url})\n"));
+            press(&mut app, KeyCode::Char('o'));
+            assert!(opened().is_empty(), "{url}");
+            assert!(app.status.starts_with("not opened"), "{}", app.status);
+        }
+    }
+
+    #[test]
+    fn relative_links_and_anchors_open_in_annotator() {
+        let dir = temp_dir();
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("sub/b.md"), "# First\n\n## Second Part\n").unwrap();
+        let text = "[b](sub/b.md#second-part)\n[dir](sub)\n[top](#readme)\n# Readme\n[gone](nope.md)\n";
+        fs::write(dir.join("a.md"), text).unwrap();
+        let mut app = link_app(&dir.join("a.md"), text);
+
+        app.cursor = 2;
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.cursor, 3, "#readme jumps to the heading");
+
+        app.cursor = 4;
+        press(&mut app, KeyCode::Char('o'));
+        assert!(app.status.starts_with("cannot open nope.md"), "{}", app.status);
+        assert_eq!(app.lines.len(), 5, "still on a.md");
+
+        app.cursor = 0;
+        press(&mut app, KeyCode::Char('o'));
+        assert!(app.file.as_ref().unwrap().ends_with("sub/b.md"));
+        assert_eq!(app.cursor, 2, "opened at #second-part");
+        assert!(opened().is_empty(), "nothing went to the system opener");
+
+        let mut app = link_app(&dir.join("a.md"), text);
+        app.cursor = 1;
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.mode, Mode::FileBrowser);
+        assert!(app.browser_path.ends_with("sub"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
